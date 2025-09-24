@@ -10,7 +10,6 @@ require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.0
 	github.com/cilium/ebpf v0.15.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-20250501130119-88bbdbc0a58d
 	github.com/daeuniverse/quic-go v0.0.0-20250210145620-2083199a7851
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/json-iterator/go v1.1.12
@@ -23,6 +22,7 @@ require (
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/cobra v1.8.1
 	github.com/stretchr/testify v1.9.0
+	github.com/tearsful/outbound v0.2.0
 	github.com/v2rayA/ahocorasick-domain v0.0.0-20231231085011-99ceb8ef3208
 	github.com/vishvananda/netlink v1.1.0
 	github.com/vishvananda/netns v0.0.4
