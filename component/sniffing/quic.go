@@ -10,7 +10,7 @@ import (
 	"io/fs"
 
 	"github.com/daeuniverse/dae/component/sniffing/internal/quicutils"
-	"github.com/daeuniverse/outbound/pool"
+	"github.com/tearsful/outbound/pool"
 )
 
 const (

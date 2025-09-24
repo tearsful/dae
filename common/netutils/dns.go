@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
-	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/pkg/fastrand"
-	"github.com/daeuniverse/outbound/pool"
+	"github.com/tearsful/outbound/netproxy"
+	"github.com/tearsful/outbound/pkg/fastrand"
+	"github.com/tearsful/outbound/pool"
 	dnsmessage "github.com/miekg/dns"
 )
 

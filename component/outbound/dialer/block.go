@@ -6,8 +6,8 @@
 package dialer
 
 import (
-	D "github.com/daeuniverse/outbound/dialer"
-	"github.com/daeuniverse/outbound/netproxy"
+	D "github.com/tearsful/outbound/dialer"
+	"github.com/tearsful/outbound/netproxy"
 )
 
 func NewBlockDialer(option *GlobalOption, dialCallback func()) (netproxy.Dialer, *Property) {

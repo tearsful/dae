@@ -6,8 +6,8 @@
 package dialer
 
 import (
-	D "github.com/daeuniverse/outbound/dialer"
-	"github.com/daeuniverse/outbound/netproxy"
+	D "github.com/tearsful/outbound/dialer"
+	"github.com/tearsful/outbound/netproxy"
 )
 
 func NewDirectDialer(option *GlobalOption, fullcone bool) (netproxy.Dialer, *Property) {
