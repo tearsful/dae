@@ -186,8 +186,8 @@ github.com/stretchr/testify v1.6.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/
 github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
 github.com/stretchr/testify v1.9.0 h1:HtqpIVDClZ4nwg75+f6Lvsy/wHu+3BoSGCbBAcpTsTg=
 github.com/stretchr/testify v1.9.0/go.mod h1:r2ic/lqez/lEtzL7wO/rwa5dbSLXVDPFyf8C91i36aY=
-github.com/tearsful/outbound v0.3.0 h1:lnFOF707Wr99w1RKNVxn5l8uYoQjg87mfwJt7+h4u6I=
-github.com/tearsful/outbound v0.3.0/go.mod h1:etItswRGJnKvViUA9/tON+gKh9aLMUiL7yBMrWsa17U=
+github.com/tearsful/outbound v0.3.1 h1:dcNjmHoYTMd0Bpdc6jKIpPSP637aYPYejjCA7Ue0dqI=
+github.com/tearsful/outbound v0.3.1/go.mod h1:etItswRGJnKvViUA9/tON+gKh9aLMUiL7yBMrWsa17U=
 github.com/tklauser/go-sysconf v0.3.12 h1:0QaGUFOdQaIVdPgfITYzaTegZvdCjmYO52cSFAEVmqU=
 github.com/tklauser/go-sysconf v0.3.12/go.mod h1:Ho14jnntGE1fpdOqQEEaiKRpvIavV0hSfmBq8nJbHYI=
 github.com/tklauser/numcpus v0.6.1 h1:ng9scYS7az0Bk4OZLvrNXNSAO2Pxr1XXRAPyjhIx+Fk=
