@@ -11,9 +11,9 @@ import (
 	"net"
 	"sync/atomic"
 
-	"github.com/daeuniverse/outbound/netproxy"
-	transportgrpc "github.com/daeuniverse/outbound/transport/grpc"
-	transportmeek "github.com/daeuniverse/outbound/transport/meek"
+	"github.com/tearsful/outbound/netproxy"
+	transportgrpc "github.com/tearsful/outbound/transport/grpc"
+	transportmeek "github.com/tearsful/outbound/transport/meek"
 )
 
 type transportCacheScopedDialer struct {

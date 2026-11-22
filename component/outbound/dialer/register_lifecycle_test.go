@@ -12,10 +12,10 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/component/daedns"
-	D "github.com/daeuniverse/outbound/dialer"
-	_ "github.com/daeuniverse/outbound/dialer/anytls"
-	"github.com/daeuniverse/outbound/netproxy"
-	_ "github.com/daeuniverse/outbound/protocol/anytls"
+	D "github.com/tearsful/outbound/dialer"
+	_ "github.com/tearsful/outbound/dialer/anytls"
+	"github.com/tearsful/outbound/netproxy"
+	_ "github.com/tearsful/outbound/protocol/anytls"
 	"github.com/sirupsen/logrus"
 	"go.uber.org/goleak"
 )

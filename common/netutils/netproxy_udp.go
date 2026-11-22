@@ -8,7 +8,7 @@ package netutils
 import (
 	"net/netip"
 
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 )
 
 // WriteUDPConn writes a UDP payload to conn and prefers packet semantics when available.

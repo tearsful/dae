@@ -16,8 +16,8 @@ import (
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
-	D "github.com/daeuniverse/outbound/dialer"
-	"github.com/daeuniverse/outbound/netproxy"
+	D "github.com/tearsful/outbound/dialer"
+	"github.com/tearsful/outbound/netproxy"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )

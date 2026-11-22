@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/daeuniverse/outbound/pool"
+	"github.com/tearsful/outbound/pool"
 )
 
 // newPanickingDirectDispatchTask builds a direct-dispatch task whose Run

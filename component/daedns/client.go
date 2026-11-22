@@ -22,9 +22,9 @@ import (
 	"github.com/daeuniverse/dae/common/netutils"
 	componentdns "github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/component/dnstransport"
-	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/pkg/fastrand"
-	tc "github.com/daeuniverse/outbound/protocol/tuic/common"
+	"github.com/tearsful/outbound/netproxy"
+	"github.com/tearsful/outbound/pkg/fastrand"
+	tc "github.com/tearsful/outbound/protocol/tuic/common"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/olicesx/quic-go"
 )

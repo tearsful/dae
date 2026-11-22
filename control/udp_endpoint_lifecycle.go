@@ -20,7 +20,7 @@ import (
 	"github.com/daeuniverse/dae/common/errors"
 	ob "github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 	"github.com/sirupsen/logrus"
 )
 

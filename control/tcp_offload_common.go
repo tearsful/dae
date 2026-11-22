@@ -6,7 +6,7 @@
 package control
 
 import (
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 )
 
 // canResolveTCPRelayOffloadConn reports whether the connection is

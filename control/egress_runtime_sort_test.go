@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/component/outbound/dialer"
-	D "github.com/daeuniverse/outbound/dialer"
+	D "github.com/tearsful/outbound/dialer"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )

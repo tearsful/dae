@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 )

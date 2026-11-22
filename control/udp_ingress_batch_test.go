@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/daeuniverse/outbound/pool"
+	"github.com/tearsful/outbound/pool"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"

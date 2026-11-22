@@ -10,7 +10,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 )
 
 // relayCopyBufferSize must stay an integer multiple of the anytls

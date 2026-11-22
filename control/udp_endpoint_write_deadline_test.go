@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 )
 
 // deadlineBehaviorPacketConn is a netproxy.PacketConn double with explicit

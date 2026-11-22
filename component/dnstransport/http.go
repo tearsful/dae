@@ -12,8 +12,8 @@ import (
 	"net/http"
 	"net/netip"
 
-	"github.com/daeuniverse/outbound/netproxy"
-	tc "github.com/daeuniverse/outbound/protocol/tuic/common"
+	"github.com/tearsful/outbound/netproxy"
+	tc "github.com/tearsful/outbound/protocol/tuic/common"
 	"github.com/olicesx/quic-go"
 	"github.com/olicesx/quic-go/http3"
 )

@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 )
 
 // batchRecorder implements PacketConn + PacketBatchWriter and records every

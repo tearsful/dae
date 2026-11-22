@@ -9,7 +9,7 @@ import (
 	"net/netip"
 	"sync"
 
-	"github.com/daeuniverse/outbound/pool"
+	"github.com/tearsful/outbound/pool"
 )
 
 type udpEndpointResponseCacheEntry struct {

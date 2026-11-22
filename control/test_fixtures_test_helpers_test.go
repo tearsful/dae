@@ -15,8 +15,8 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	ob "github.com/daeuniverse/dae/component/outbound"
 	componentdialer "github.com/daeuniverse/dae/component/outbound/dialer"
-	D "github.com/daeuniverse/outbound/dialer"
-	"github.com/daeuniverse/outbound/netproxy"
+	D "github.com/tearsful/outbound/dialer"
+	"github.com/tearsful/outbound/netproxy"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 )

@@ -26,8 +26,8 @@ import (
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
-	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol/direct"
+	"github.com/tearsful/outbound/netproxy"
+	"github.com/tearsful/outbound/protocol/direct"
 	"github.com/dlclark/regexp2"
 	"github.com/sirupsen/logrus"
 )

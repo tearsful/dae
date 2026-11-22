@@ -12,7 +12,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/daeuniverse/outbound/pool"
+	"github.com/tearsful/outbound/pool"
 )
 
 // TestSenderStopRecycleDoesNotDoubleRelease locks the invariant that was

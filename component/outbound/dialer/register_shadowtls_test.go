@@ -13,8 +13,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	_ "github.com/daeuniverse/outbound/protocol/shadowsocks"
-	_ "github.com/daeuniverse/outbound/transport/shadowtls"
+	_ "github.com/tearsful/outbound/protocol/shadowsocks"
+	_ "github.com/tearsful/outbound/transport/shadowtls"
 )
 
 func shadowTLSNodeID(d *Dialer) string {

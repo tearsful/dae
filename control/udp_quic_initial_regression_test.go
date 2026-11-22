@@ -11,7 +11,7 @@ import (
 	"testing"
 
 	"github.com/daeuniverse/dae/common/consts"
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 )
 
 func makeLikelyQuicInitialPayload(dcidSeed byte) []byte {

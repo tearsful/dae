@@ -10,7 +10,7 @@ import (
 	"net"
 
 	"github.com/daeuniverse/dae/common"
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 )
 
 const (

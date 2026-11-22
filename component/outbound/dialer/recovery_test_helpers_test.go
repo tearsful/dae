@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
-	D "github.com/daeuniverse/outbound/dialer"
-	"github.com/daeuniverse/outbound/protocol/direct"
+	D "github.com/tearsful/outbound/dialer"
+	"github.com/tearsful/outbound/protocol/direct"
 	"github.com/sirupsen/logrus"
 )
 

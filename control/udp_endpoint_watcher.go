@@ -13,9 +13,9 @@ import (
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/errors"
-	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/pool"
-	"github.com/daeuniverse/outbound/protocol"
+	"github.com/tearsful/outbound/netproxy"
+	"github.com/tearsful/outbound/pool"
+	"github.com/tearsful/outbound/protocol"
 	"github.com/sirupsen/logrus"
 )
 

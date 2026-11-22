@@ -13,7 +13,7 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
-	D "github.com/daeuniverse/outbound/dialer"
+	D "github.com/tearsful/outbound/dialer"
 	"github.com/sirupsen/logrus"
 )
 

@@ -54,6 +54,6 @@ func TestMain(m *testing.M) {
 		// epoll loop with no stop API (one loop shared by every direct
 		// endpoint, alive for the process lifetime). Tests that dial a real
 		// direct conn (udp_endpoint_receiver_test.go) start it on first use.
-		goleak.IgnoreAnyFunction("github.com/daeuniverse/outbound/protocol/direct.(*packetReceiverRegistry).loop"),
+		goleak.IgnoreAnyFunction("github.com/tearsful/outbound/protocol/direct.(*packetReceiverRegistry).loop"),
 	)
 }

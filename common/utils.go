@@ -20,8 +20,8 @@ import (
 	"time"
 	"unsafe"
 
-	obcommon "github.com/daeuniverse/outbound/common"
-	"github.com/daeuniverse/outbound/netproxy"
+	obcommon "github.com/tearsful/outbound/common"
+	"github.com/tearsful/outbound/netproxy"
 
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
 	dnsmessage "github.com/miekg/dns"

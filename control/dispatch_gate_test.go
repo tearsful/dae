@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/daeuniverse/outbound/pool"
+	"github.com/tearsful/outbound/pool"
 )
 
 // TestUdpIngressTaskDiscardReleasesDispatchSem pins the direct-dispatch

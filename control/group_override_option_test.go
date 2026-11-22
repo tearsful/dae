@@ -14,7 +14,7 @@ import (
 	"github.com/daeuniverse/dae/component/daedns"
 	componentdialer "github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/config"
-	"github.com/daeuniverse/outbound/protocol/direct"
+	"github.com/tearsful/outbound/protocol/direct"
 	"github.com/sirupsen/logrus"
 )
 

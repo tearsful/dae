@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	stickyip "github.com/daeuniverse/outbound/dialer/stickyip"
+	stickyip "github.com/tearsful/outbound/dialer/stickyip"
 )
 
 // Re-export from stickyip package

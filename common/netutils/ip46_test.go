@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol/direct"
+	"github.com/tearsful/outbound/netproxy"
+	"github.com/tearsful/outbound/protocol/direct"
 	dnsmessage "github.com/miekg/dns"
 )
 

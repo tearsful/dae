@@ -14,7 +14,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/daeuniverse/dae/common/consts"
-	"github.com/daeuniverse/outbound/pool"
+	"github.com/tearsful/outbound/pool"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"

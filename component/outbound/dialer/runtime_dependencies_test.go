@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/config"
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 )
 
 type runtimeDependencyDialer struct{ id int }

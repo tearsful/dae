@@ -11,7 +11,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/daeuniverse/outbound/dialer/shadowsocks"
+	"github.com/tearsful/outbound/dialer/shadowsocks"
 	"github.com/sirupsen/logrus"
 )
 

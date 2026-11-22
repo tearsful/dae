@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"github.com/daeuniverse/dae/common"
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 )
 
 // recordingDialer records the network of every dial attempt and fails right

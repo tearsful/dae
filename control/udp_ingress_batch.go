@@ -10,7 +10,7 @@ import (
 	"net/netip"
 
 	"github.com/daeuniverse/dae/common/consts"
-	"github.com/daeuniverse/outbound/pool"
+	"github.com/tearsful/outbound/pool"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"

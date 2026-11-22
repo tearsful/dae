@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/pool"
+	"github.com/tearsful/outbound/netproxy"
+	"github.com/tearsful/outbound/pool"
 	"github.com/stretchr/testify/require"
 )
 

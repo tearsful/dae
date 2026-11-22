@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 	"golang.org/x/sys/unix"
 )
 

@@ -15,7 +15,7 @@ import (
 	"time"
 
 	daeerrors "github.com/daeuniverse/dae/common/errors"
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 	"github.com/olicesx/quic-go"
 )
 

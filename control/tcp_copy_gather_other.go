@@ -5,7 +5,7 @@ package control
 import (
 	"context"
 
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 )
 
 func tryRelayGatherWrite(_ context.Context, _ netproxy.Conn, _ netproxy.Conn, _ func(int64)) (written int64, err error, ok bool) {

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/tearsful/outbound/netproxy"
 )
 
 // BenchmarkUdpProxyDial measures the cost of the proxy-dial slow path under

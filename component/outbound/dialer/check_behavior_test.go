@@ -11,8 +11,8 @@ import (
 	"net"
 	"testing"
 
-	_ "github.com/daeuniverse/outbound/dialer/shadowsocks"
-	_ "github.com/daeuniverse/outbound/protocol/shadowsocks"
+	_ "github.com/tearsful/outbound/dialer/shadowsocks"
+	_ "github.com/tearsful/outbound/protocol/shadowsocks"
 	"github.com/sirupsen/logrus"
 )
 

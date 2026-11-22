@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/daeuniverse/outbound/protocol"
+	"github.com/tearsful/outbound/protocol"
 )
 
 // TestApplyUpstreamReadErrorPolicySkipsUnresolvedDatagram pins that a datagram
