@@ -14,6 +14,10 @@ Branch: `chore/upstream-bpf-tproxy`
 | `#986` GCC 15 CO-RE | cherry-pick |
 | `#1087` `TC_ACT_PIPE` on wan_egress pass-through | **manual port** (tree diverged from L2/L3 split) |
 | `#1172` clang-23 cmdline index bound | **manual port** (`asm` barrier instead of `barrier_var`) |
+| `#991` cmdline pname parsing | already present in tearsful tree (kept + clang-23 bound) |
+| `#995` `bpf_get_current_comm` fallback | **manual port** via `PARAM.has_bpf_get_current_task` (no stub rewrite) |
+
+Also: `common/bitlist` Tighten / Cap expectations aligned with upstream.
 
 ## Still deferred (hard conflict with tearsful tree)
 
@@ -22,9 +26,7 @@ These need a larger rebase onto upstream control/kern (L2/L3 program split, kdae
 | Upstream | Why deferred |
 |---|---|
 | `#822` separate L2/L3 netdev programs | massive tproxy.c / loader rewrite |
-| `#991` restore cmdline parsing | conflicts with existing pname path |
-| `#995` `bpf_get_current_comm` fallback | modify/delete `bpf_stub.go` |
 | `#1160` avoid 4-byte L3 loads | depends on L2/L3 split + deleted verifier test |
 | `#1099` kdae full sync | full datapath rewrite — do as dedicated rebase |
 
-Until those land, prefer keeping this branch merged for the security/correctness fixes above rather than waiting on a full upstream rebase.
+Until those land, prefer keeping the landed safety/correctness fixes above rather than waiting on a full upstream rebase.

@@ -182,7 +182,8 @@ struct dae_param {
 	__u32 dae0_ifindex;
 	__u32 dae_netns_id;
 	__u8 dae0peer_mac[6];
-	__u8 padding[2];
+	__u8 has_bpf_get_current_task; // 0 => fall back to bpf_get_current_comm
+	__u8 padding;
 };
 
 static volatile const struct dae_param PARAM = {};
@@ -1807,6 +1808,17 @@ static int __noinline get_real_comm_loop_cb(__u32 index, void *data)
 static __always_inline int get_pid_pname(struct pid_pname *pid_pname)
 {
 	int ret;
+
+	pid_pname->pid = bpf_get_current_pid_tgid() >> 32;
+
+	// Older kernels without bpf_get_current_task: use truncated comm.
+	if (!PARAM.has_bpf_get_current_task) {
+		if (bpf_get_current_comm(&pid_pname->pname,
+					 sizeof(pid_pname->pname)))
+			pid_pname->pname[0] = '\0';
+		return 0;
+	}
+
 	// Get pointer to args string.
 	struct task_struct *task = (void *)bpf_get_current_task();
 	char *args = (void *)BPF_CORE_READ(task, mm, arg_start);
@@ -1818,16 +1830,21 @@ static __always_inline int get_pid_pname(struct pid_pname *pid_pname)
 	ctx.arg_buf = arg_buf;
 	ret = bpf_core_read_user_str(arg_buf, MAX_ARG_LEN, args);
 	if (unlikely(ret < 0)) {
-		bpf_printk(
-			"failed to read process name: bpf_core_read_user_str: %d",
-			ret);
-		return ret;
+		// Degrade to comm rather than failing the whole match path.
+		if (bpf_get_current_comm(&pid_pname->pname,
+					 sizeof(pid_pname->pname)))
+			pid_pname->pname[0] = '\0';
+		return 0;
 	}
 
 	// Find range of command name.
 	ret = bpf_loop(MAX_ARG_LEN, get_real_comm_loop_cb, &ctx, 0);
-	if (unlikely(ret < 0))
-		return ret;
+	if (unlikely(ret < 0)) {
+		if (bpf_get_current_comm(&pid_pname->pname,
+					 sizeof(pid_pname->pname)))
+			pid_pname->pname[0] = '\0';
+		return 0;
+	}
 
 	u8 offset = ctx.l;
 
@@ -1842,14 +1859,6 @@ static __always_inline int get_pid_pname(struct pid_pname *pid_pname)
 			pid_pname->pname[i] = '\0';
 			break;
 		}
-	}
-
-	// Pupulate tgid
-	ret = bpf_core_read(&pid_pname->pid, sizeof(pid_pname->pid),
-			    &task->tgid);
-	if (unlikely(ret < 0)) {
-		bpf_printk("failed to read pid: %d", ret);
-		return ret;
 	}
 	return 0;
 }
