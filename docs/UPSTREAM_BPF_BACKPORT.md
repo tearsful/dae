@@ -23,7 +23,7 @@ Also: `common/bitlist` Tighten / Cap expectations aligned with upstream.
 
 | Upstream | Why deferred |
 |---|---|
-| `#1099` kdae full sync | ~4k-line datapath/control/cmd rewrite; needs dedicated rebase *on top of* L2/L3 |
+| `#1099` kdae full sync | landed on `chore/kdae-datapath-rebase` (outbound via `github.com/tearsful/outbound` v0.3.20+) |
 | `#1110` LAN UDP exact bind match | depends on kdae lan-ingress local-socket bypass path |
 | fast-path `parse_transport_fast` + `#1160` helpers | comes with kdae; bring `pkt_load16/32` together |
 

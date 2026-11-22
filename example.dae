@@ -29,8 +29,15 @@ global {
     # Set non-zero value to enable pprof.
     pprof_port: 0
 
-    # If not zero, traffic sent from dae will be set SO_MARK. It is useful to avoid traffic loop with iptables tproxy
-    # rules.
+    # Maximum entries for the shared TCP/UDP eBPF connection-state map.
+    # Lower values reduce locked kernel memory but lower the maximum tracked concurrent flows.
+    # Takes effect on fresh eBPF load or restart; same-port reload keeps the live map.
+    bpf_conn_state_map_size: 262144
+
+    # Socket mark for dae-originated traffic.
+    # If omitted, dae auto-selects an internal mark to prevent UDP self-capture.
+    # Set a non-zero value to override that mark.
+    # Set 0 explicitly to keep the internal protection mark without the unset warning.
     so_mark_from_dae: 0
 
     # Log level: error, warn, info, debug, trace.
@@ -38,6 +45,12 @@ global {
 
     # Disable waiting for network before pulling subscriptions.
     disable_waiting_network: false
+
+    # Opt the dae process out of transparent huge pages.
+    # Off by default: dae leaves kernel memory policy untouched. Enable it if
+    # you observe RSS inflation from THP-backed matcher memory on THP=always
+    # systems.
+    disable_thp: false
 
     ##### Interface and kernel options.
 
@@ -73,6 +86,13 @@ global {
     #udp_check_dns: 'dns.google:53'
     udp_check_dns: 'dns.google:53,8.8.8.8,2001:4860:4860::8888'
 
+    # Additionally check whether udp_check_dns' host answers DNS over TCP. The result is advisory only: it is logged and
+    # shown per node, and never affects node selection.
+    # Turn it off to save the two extra probes per check_interval if dns.upstream uses https (DoH) or udp, where the
+    # legs cannot observe the real upstream anyway.
+    #check_dns_tcp: false
+    check_dns_tcp: true
+
     check_interval: 30s
 
     # Group will switch node only when new_latency <= old_latency - tolerance.
@@ -101,9 +121,14 @@ global {
     # Allow insecure TLS certificates. It is not recommended to turn it on unless you have to.
     allow_insecure: false
 
-    # Timeout to waiting for first data sending for sniffing. It is always 0 if dial_mode is ip. Set it higher is useful
-    # in high latency LAN network.
-    sniffing_timeout: 100ms
+    # Timeout to waiting for first data sending for sniffing. It is always 0 if dial_mode is ip.
+    # Default 30ms is suitable for most networks. Increase to 100-300ms for high-latency networks.
+    sniffing_timeout: 30ms
+
+    # Inject kernel-space-only sniff-punt rules for device-scoped domain whitelists whose
+    # device uses its own DNS (so the domain conditions would otherwise never match).
+    # Requires sniffing to be enabled (sniffing_timeout > 0 and dial_mode != ip).
+    auto_sniff_punt: true
 
     # TLS implementation. tls is to use Go's crypto/tls. utls is to use uTLS, which can imitate browser's Client Hello.
     tls_implementation: tls
@@ -112,9 +137,24 @@ global {
     # See more: https://github.com/daeuniverse/dae/blob/331fa23c16/component/outbound/transport/tls/utls.go#L17
     utls_imitate: chrome_auto
 
+    # TLS fragmentation support. If is true, dae will send Client Hello in fragments to bypass SNI blocking.
+    tls_fragment: false
+
+    # TLS fragment packet length range, in bytes. The length of each fragment is randomly generated from this range.
+    tls_fragment_length: '50-100'
+
+    # TLS fragment packet length, in milliseconds. Each fragment interval is randomly generated from this range.
+    tls_fragment_interval: '10-20'
+
     # Multipath TCP (MPTCP) support. If is true, dae will try to use MPTCP to connect all nodes, but it will only take
     # effects when the node supports MPTCP. It can use for load balance and failover to multiple interfaces and IPs.
     mptcp: false
+
+    # Explicit DNS resolver for bootstrap-only lookups before dae DNS routing is ready, such as resolving named DNS
+    # upstream hosts and dial_mode real-domain probes. When unset, dae uses 119.29.29.29:53 and 223.5.5.5:53 in
+    # order. Setting bootstrap_resolver disables those defaults. For IPv4 DNS servers, use "ipv4:port". For IPv6
+    # DNS servers, use "[ipv6]:port".
+    # bootstrap_resolver: '9.9.9.9:53'
 
     # The maximum bandwidth for accessing the Internet. It is useful for some specific protocols (e.g., Hysteria2),
     # which will perform better with bandwith information provided. The unit can be b, kb, mb, gb, tb or bytes per second.
@@ -172,6 +212,32 @@ dns {
     #    test.example.org: 3600
     #}
 
+    # Enable optimistic cache (RFC 8767) to improve cache hit rate and reduce latency.
+    # When enabled, expired cache entries within stale window are still returned while 
+    # background refresh updates the cache.
+    # This significantly improves user experience by serving stale data instead of waiting.
+    # Default: true
+    #optimistic_cache: true
+
+    # Stale window duration in seconds for optimistic cache (RFC 8767).
+    # Expired cache entries within this window will be returned while background refresh happens.
+    # Set to 0 to never expire (rely on LRU eviction when cache is full).
+    # Default: 60
+    #optimistic_cache_ttl: 60
+
+    # Maximum number of DNS cache entries.
+    # When cache size exceeds this limit, least recently used entries will be evicted.
+    # Set to 0 for unlimited cache size.
+    # The finite default keeps high-cardinality query streams from growing memory without bound.
+    # Default: 65536
+    #max_cache_size: 65536
+
+    # Bind to local address to listen for DNS queries
+    # bind: '127.0.0.1:5353'
+    # bind: 'tcp://127.0.0.1:5353'
+    # bind: 'udp://127.0.0.1:5353'
+    # bind: 'tcp+udp://127.0.0.1:5353'
+
     upstream {
         # Value can be scheme://host:port, where the scheme can be tcp/udp/tcp+udp/h3/http3/quic/https/tls.
         # If the protocol is h3/http3/https, it supports setting a custom path, that is, the format can be "protocol://host:port/custom path".
@@ -203,6 +269,31 @@ dns {
         request {
             # Lookup China mainland domains using alidns, otherwise googledns.
             qname(geosite:cn) -> alidns
+
+            # The same request block can also route dae's own internal DNS lookups.
+            # These selectors are independent from normal qname/qtype matching and can only use names
+            # defined in dns.upstream on the right-hand side.
+            #
+            # sub() is for subscription fetch requests.
+            # Example: use googledns when fetching subscription "my_sub".
+            # sub(my_sub) -> googledns
+            #
+            # node() is for node host resolution.
+            # Example: use googledns for nodes whose names contain "hk".
+            # node(name_keyword: hk) -> googledns
+            #
+            # subnode() is for subscription-derived node host resolution and is checked before node().
+            # Example: nodes from "my_sub" with "hk" in the node name use alidns first.
+            # subnode(subtag: my_sub, name_keyword: hk) -> alidns
+            #
+            # Catch-all forms are also supported:
+            # sub() -> googledns
+            # node() -> googledns
+            # subnode() -> alidns
+            #
+            # Note: sub() only affects fetching the subscription itself.
+            # Parsed nodes from that subscription will still follow subnode()/node() rules instead.
+
             # fallback is also called default.
             fallback: googledns
         }
@@ -307,4 +398,92 @@ routing {
     domain(geosite:cn) -> direct
 
     fallback: my_group
+}
+
+# Native HTTP control-plane API, compatible with the api-standardize contract.
+# See https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/api.md for full examples
+# and https://github.com/daeuniverse/dae/blob/main/docs/en/development/api.md for endpoints.
+#
+# Authentication modes, pick one:
+# 1. Token mode: set a non-empty secret. Every request except GET /api (discovery) must send
+#    "Authorization: Bearer <secret>". GET /api stays public, but /api/v1/version and
+#    /api/v1/capabilities also require the token.
+# 2. Anonymous loopback: leave secret empty, set allow_anonymous_loopback: true and listen on a
+#    loopback address. A listener on a non-loopback address always requires secret, and an
+#    enabled listener with neither mode fails validation.
+#
+# dae serves plain HTTP and never terminates TLS. When listening on a non-loopback address,
+# terminate TLS at a trusted reverse proxy and never expose the listener directly to an
+# untrusted network.
+#
+# Every field below is restart-required: a reload that changes them is rejected or keeps the
+# previous listener and logs a warning, so the listener is never partially recreated.
+api {
+    ##### Listener.
+
+    # Start the native listener. Disabled by default.
+    enabled: false
+
+    # Numeric IP and port to listen on. Hostnames and the ":port" shorthand are rejected.
+    # Wildcard binds (0.0.0.0 or ::) count as non-loopback and therefore require secret.
+    listen: '127.0.0.1:9527'
+
+    # Static bearer token. A non-empty value selects token mode.
+    # Must be visible ASCII without whitespace or commas; use at least 16 unpredictable bytes.
+    # Secrets are never returned by the API or written to logs.
+    #secret: 'replace-with-a-long-random-token'
+
+    # Permit credential-free requests, but only when secret is empty and the listener is
+    # actually bound to a loopback address.
+    #allow_anonymous_loopback: true
+
+    ##### Browser access.
+
+    # Exact HTTP(S) origins allowed for cross-origin browser access, split by ",".
+    # Empty disables cross-origin access. Wildcards and paths are not allowed.
+    #allow_origins: 'https://board.zash.run.place,https://demo.daeuniverse.org'
+
+    # Additional Host authorities accepted by the listener, split by ",". Use it behind a
+    # reverse proxy; an omitted port means 80 and IPv6 hosts must be bracketed.
+    # Without it the Host header must name the listening authority (loopback listeners also
+    # accept localhost, 127.0.0.1 and [::1] at the listening port), and a wildcard bind accepts
+    # IP literals and localhost only, so DNS names need this list.
+    # Forwarded headers are not trusted as authorization.
+    #allowed_hosts: 'panel.example,panel.example:443'
+
+    ##### Self-hosted UI.
+
+    # Absolute path to a directory holding a built frontend (with index.html). It is served at
+    # /ui/ without credentials, while API calls still require the token and the Host/Origin
+    # checks above still apply. Other paths redirect there, directory listings are disabled,
+    # extensionless misses fall back to index.html and a missing asset is a real 404.
+    # A missing or unusable directory only logs a warning and answers 404; it never stops dae.
+    # Empty disables UI hosting.
+    #ui: '/usr/share/doona'
+
+    ##### Configuration writes.
+
+    # Allow control callers to replace editable configuration sources over the API.
+    # Requires secret, and the configuration directory must be split into config.dae (exactly
+    # one include block), api.dae and config.d/{global,subscription,node,group,routing,dns}.dae.
+    # api.dae is hidden from the API (and answers 404), and a replacement may not change the
+    # api block; changing listen, port or secret stays a manual edit plus a restart.
+    # A candidate is validated with the same chain as "dae validate -c": a rejected one answers
+    # 422 with line numbers and nothing is written, so no partial replacement is possible.
+    #config_write: true
+
+    ##### Traffic accounting.
+
+    # Stop reporting cumulative bytes per connection (upload_bytes and download_bytes).
+    # Only the TCP flows dae forwards in userspace carry those counters, so a total
+    # aggregated from them covers a fraction of the traffic; the two fields stay null instead.
+    #disable_connection_bytes: true
+
+    # Count traffic dae routes directly, with a read-only eBPF observer on the WAN/LAN
+    # interfaces dae already binds. Off by default; it never changes forwarding or marks.
+    # Figures are link bytes and a lower bound: the first packet of every flow and flows that
+    # predate a restart are not counted, and non-TCP/UDP traffic is skipped. Every packet on
+    # those interfaces then pays for a map lookup or two, so keep it off unless
+    # GET /api/v1/runtime/direct-stats is needed.
+    #direct_stats: false
 }

@@ -1,6 +1,6 @@
 /*
 *  SPDX-License-Identifier: AGPL-3.0-only
-*  Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+*  Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 // Package trie is modified from https://github.com/openacid/succinct/blob/loc100/sskv.go.
@@ -101,14 +101,28 @@ func Prefix2bin128(prefix netip.Prefix) (bin128 string) {
 	if n == -1 {
 		panic("! BadPrefix: " + prefix.String())
 	}
-	if prefix.Addr().Is4() {
+	addr := prefix.Addr()
+	if addr.Is4In6() && n <= 32 {
+		// IPv4-mapped IPv6 prefix written with an IPv4 bit count
+		// (::ffff:1.2.3.0/24, and the 16-byte encoding used by geoip .dat
+		// data). Lookups always encode IPv4 as the 128-bit mapped form
+		// (::ffff:a.b.c.d/128), so storing only the first n mapped bits
+		// - which are all zero - made the entry match EVERY IPv4 address.
+		// Unmap first: the Is4 branch below then re-adds the 96-bit mapping
+		// offset, yielding mapping(96 bits) + the n IPv4 bits.
+		//
+		// n > 32 keeps the plain 128-bit reading (::ffff:1.2.3.0/120 is
+		// already the mapped spelling of 1.2.3.0/24 and needs no rewrite).
+		addr = addr.Unmap()
+	}
+	if addr.Is4() {
 		n += 96
 	}
-	ip := prefix.Addr().As16()
+	ip := addr.As16()
 	buf := pool.GetBuffer()
 	defer pool.PutBuffer(buf)
 loop:
-	for i := 0; i < len(ip); i++ {
+	for i := range len(ip) {
 		for j := 7; j >= 0; j-- {
 			if (ip[i]>>j)&1 == 1 {
 				_ = buf.WriteByte('1')
@@ -150,20 +164,57 @@ func NewTrie(keys []string, chars *ValidChars) (*Trie, error) {
 		}
 	}
 
+	if len(keys) == 0 {
+		// A trie with no keys matches nothing. Build a degenerate trie
+		// instead of panicking on the ranks/selects bookkeeping below.
+		return &Trie{chars: chars}, nil
+	}
+
+	// s and e are spans into keys, col is a character column, so int32 is far
+	// beyond any reachable bound while halving the queue: this is the largest
+	// transient in the build, and the whole queue is live until the trie is
+	// finished.
+	type qElt struct{ s, e, col int32 }
+
+	// Pre-compute exact queue size from sorted keys to avoid both growslice
+	// and over-allocation. For sorted distinct strings, trie node count is:
+	// 1 + Σ(len(key[i]) - LCP(key[i], key[i-1])) for i=0..n-1 (LCP(key[0], key[-1]) = 0)
+	// Each character is compared at most once, so this pass is O(totalChars).
+	nodeCount := 1 // root
+	for i, key := range keys {
+		if i == 0 {
+			nodeCount += len(key)
+			continue
+		}
+		prev := keys[i-1]
+		minLen := min(len(key), len(prev))
+		lcp := 0
+		for lcp < minLen && prev[lcp] == key[lcp] {
+			lcp++
+		}
+		nodeCount += len(key) - lcp
+	}
+	// Size every builder from nodeCount up front. nodeCount nodes imply
+	// nodeCount-1 edges and 2*nodeCount-1 label-bitmap bits, so the label
+	// list, the leaf bitset and the label bitmap all have a known final size.
+	// Growing them instead doubles peak memory while a reload builds the next
+	// generation's routing matcher, and the matcher is the largest object dae
+	// allocates.
 	ss := &Trie{
-		chars:  chars,
-		labels: bitlist.NewCompactBitList(bits.Len(uint(chars.Size()))),
+		chars:       chars,
+		labels:      bitlist.NewCompactBitListCap(bits.Len(uint(chars.Size())), nodeCount-1),
+		leaves:      make([]uint64, 0, (nodeCount+63)/64),
+		labelBitmap: make([]uint64, 0, (2*nodeCount+63)/64),
 	}
 	lIdx := 0
 
-	type qElt struct{ s, e, col int }
-
-	queue := []qElt{{0, len(keys), 0}}
+	queue := make([]qElt, 0, nodeCount)
+	queue = append(queue, qElt{0, int32(len(keys)), 0})
 
 	for i := 0; i < len(queue); i++ {
 		elt := queue[i]
 
-		if elt.col == len(keys[elt.s]) {
+		if int(elt.col) == len(keys[elt.s]) {
 			// a leaf node
 			elt.s++
 			setBit(&ss.leaves, i, 1)
@@ -188,19 +239,14 @@ func NewTrie(keys []string, chars *ValidChars) (*Trie, error) {
 
 	ss.init()
 
-	// Tighten.
+	// Tighten. The builders above were sized from nodeCount, so this normally
+	// only copies when the estimate came up short.
 	ss.labels.Tighten()
+	ss.leaves = tightenUint64(ss.leaves)
+	ss.labelBitmap = tightenUint64(ss.labelBitmap)
 
-	leaves := make([]uint64, len(ss.leaves))
-	copy(leaves, ss.leaves)
-	ss.leaves = leaves
-
-	labelBitmap := make([]uint64, len(ss.labelBitmap))
-	copy(labelBitmap, ss.labelBitmap)
-	ss.labelBitmap = labelBitmap
-
-	ss.ranksBL = bitlist.NewCompactBitList(bits.Len64(uint64(ss.ranks[len(ss.ranks)-1])))
-	ss.selectsBL = bitlist.NewCompactBitList(bits.Len64(uint64(ss.selects[len(ss.selects)-1])))
+	ss.ranksBL = bitlist.NewCompactBitListCap(bits.Len64(uint64(ss.ranks[len(ss.ranks)-1])), len(ss.ranks))
+	ss.selectsBL = bitlist.NewCompactBitListCap(bits.Len64(uint64(ss.selects[len(ss.selects)-1])), len(ss.selects))
 	for _, v := range ss.ranks {
 		ss.ranksBL.Append(uint64(v))
 	}
@@ -217,6 +263,10 @@ func NewTrie(keys []string, chars *ValidChars) (*Trie, error) {
 
 // HasPrefix query for a word and return whether a prefix of the word is in the Trie.
 func (ss *Trie) HasPrefix(word string) bool {
+	if len(ss.leaves) == 0 {
+		// Degenerate (empty) trie: no key was stored, nothing can match.
+		return false
+	}
 
 	nodeId, bmIdx := 0, 0
 
@@ -246,6 +296,17 @@ func (ss *Trie) HasPrefix(word string) bool {
 	}
 
 	return getBit(ss.leaves, nodeId) != 0
+}
+
+// tightenUint64 drops the spare capacity of a bitset so a retained trie does
+// not pin words it can never index.
+func tightenUint64(bm []uint64) []uint64 {
+	if cap(bm) == len(bm) {
+		return bm
+	}
+	out := make([]uint64, len(bm))
+	copy(out, bm)
+	return out
 }
 
 func setBit(bm *[]uint64, i int, v int) {
@@ -285,7 +346,12 @@ func (ss *Trie) init() {
 //	countZeros("010010", 4) == 3
 //	//          012345
 func countZeros(bm []uint64, ranks *bitlist.CompactBitList, i int) int {
-	return i - int(ranks.Get(i>>6)) - bits.OnesCount64(bm[i>>6]&(1<<uint(i&63)-1))
+	// Optimized: compute mask once and reuse
+	// i - popcount(bm[0..i)) = i - rank(i)
+	// where rank(i) = ranks.Get(i>>6) + popcount(bm[i>>6] & ((1<<(i&63))-1))
+	wordIdx := i >> 6
+	bitIdx := i & 63
+	return i - int(ranks.Get(wordIdx)) - bits.OnesCount64(bm[wordIdx]&(1<<bitIdx-1))
 }
 
 // selectIthOne returns the index of the i-th "1" in a bitmap, on behalf of rank
@@ -305,7 +371,10 @@ func selectIthOne(bm []uint64, ranks, selects *bitlist.CompactBitList, i int) in
 			if findIthOne < 0 {
 				return i<<6 + bitIdx
 			}
-			t0 := bits.TrailingZeros64(w &^ 1)
+			// Optimized: use w>>1 instead of w&^1 to save one bitwise operation.
+			// TrailingZeros64(w>>1) + 1 == TrailingZeros64(w &^ 1) when w has trailing zeros.
+			// When w ends with 1, w>>1 shifts it, and we add 1 to compensate.
+			t0 := bits.TrailingZeros64(w>>1) + 1
 			w >>= uint(t0)
 			bitIdx += t0
 		}

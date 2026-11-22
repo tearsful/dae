@@ -1,52 +1,224 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 package control
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net/netip"
-	"os"
-	"regexp"
+	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cilium/ebpf"
 	ciliumLink "github.com/cilium/ebpf/link"
-	"github.com/daeuniverse/dae/common"
-	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component"
+	"github.com/daeuniverse/dae/component/outbound"
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
-	dnsmessage "github.com/miekg/dns"
-	"github.com/mohae/deepcopy"
-	"github.com/safchain/ethtool"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 )
 
-// coreFlip should be 0 or 1
-var coreFlip = 0
+// coreFlip should be 0 or 1; accessed atomically.
+var coreFlip int32
+
+var configureNetlinkSocketTimeoutOnce sync.Once
+
+var (
+	listTCFilters  = netlink.FilterList
+	deleteTCFilter = netlink.FilterDel
+)
+
+type cgroupAttachment interface {
+	io.Closer
+}
+
+var (
+	detectCgroupPathFunc = detectCgroupPath
+	attachCgroupFunc     = func(opts ciliumLink.CgroupOptions) (cgroupAttachment, error) {
+		return ciliumLink.AttachCgroup(opts)
+	}
+)
+
+type sharedUdpConnStateTrackerEntry struct {
+	tracker *udpConnStateTracker
+	refs    int
+}
+
+var sharedUdpConnStateTrackerRegistry = struct {
+	mu      sync.Mutex
+	entries map[*bpfObjects]*sharedUdpConnStateTrackerEntry
+}{
+	entries: make(map[*bpfObjects]*sharedUdpConnStateTrackerEntry),
+}
+
+func acquireSharedUdpConnStateTracker(bpf *bpfObjects) *udpConnStateTracker {
+	if bpf == nil {
+		return newUdpConnStateTracker()
+	}
+
+	sharedUdpConnStateTrackerRegistry.mu.Lock()
+	defer sharedUdpConnStateTrackerRegistry.mu.Unlock()
+
+	entry := sharedUdpConnStateTrackerRegistry.entries[bpf]
+	if entry == nil {
+		entry = &sharedUdpConnStateTrackerEntry{
+			tracker: newUdpConnStateTracker(),
+		}
+		sharedUdpConnStateTrackerRegistry.entries[bpf] = entry
+	}
+	entry.refs++
+	return entry.tracker
+}
+
+func releaseSharedUdpConnStateTracker(bpf *bpfObjects, tracker *udpConnStateTracker) {
+	if bpf == nil || tracker == nil {
+		return
+	}
+
+	sharedUdpConnStateTrackerRegistry.mu.Lock()
+	defer sharedUdpConnStateTrackerRegistry.mu.Unlock()
+
+	entry := sharedUdpConnStateTrackerRegistry.entries[bpf]
+	if entry == nil || entry.tracker != tracker {
+		return
+	}
+	entry.refs--
+	if entry.refs <= 0 {
+		delete(sharedUdpConnStateTrackerRegistry.entries, bpf)
+	}
+}
 
 type controlPlaneCore struct {
-	mu sync.Mutex
+	mu      sync.Mutex
+	deferMu sync.Mutex
 
-	log             *logrus.Logger
-	deferFuncs      []func() error
-	bpf             *bpfObjects
+	log *logrus.Logger
+	// deferFuncs is guarded by deferMu (addDeferFunc appends; Close drains it
+	// under the same lock). The seed value is written only during construction,
+	// before the core is published.
+	deferFuncs []func() error
+	// bpfHookDetachFuncs contains non-TC BPF hook detachments. tcHooks owns TC
+	// links and filters as one transferable Module. Both are detached immediately
+	// before other cleanup that might take longer (like dialer shutdown).
+	// Protected by bpfHookMu to avoid deadlock with c.mu in _bindLan/_bindWan.
+	bpfHookDetachFuncs []func() error
+	bpfHookMu          sync.Mutex
+	bpfHookDetachMu    sync.Mutex
+	bpfHookAttachWg    sync.WaitGroup
+	// tcHooks is the single owner of TCX links or classic filters. A prepared
+	// handoff borrows the active set for commit, then swaps this pointer between
+	// generations before supervisor publication.
+	tcHookMu            sync.Mutex
+	tcHooks             *tcHookSet
+	tcHookStage         *tcHookSet
+	tcHookStageDeferred bool
+	preparedTCHooks     *preparedTCHookHandoff
+	// directStats is the opt-in direct-traffic observer object. It is loaded
+	// lazily on the first WAN/LAN bind while api.direct_stats is on.
+	directStatsMu       sync.Mutex
+	directStats         *directStatsObserver
+	directStatsBridgeMu sync.RWMutex
+	directStatsBridges  map[int]directStatsBridgeRole
+	// directStatsPorts maps an observed bridge port ifindex to the bridge
+	// ifindex and role it was observed under. It lets a port that leaves the
+	// bridge (or whose bridge disappears) lose its observer instead of counting
+	// traffic on an interface dae no longer owns, and it lets a role change drop
+	// an obsolete LAN egress hook.
+	directStatsPorts map[int]directStatsPortRole
+	// directStatsStatusMu guards the most recent observer load/attach error.
+	directStatsStatusMu  sync.Mutex
+	directStatsStatusErr string
+	// nodeParseReport is how many links each subscription supplied and how
+	// many of them became dialers. It is written once during construction and
+	// read by the reload caller to decide whether a fetched payload may
+	// replace its cached copy.
+	nodeParseReport map[string]outbound.NodeParseCount
+	bpf             atomic.Pointer[bpfObjects]
+	// outboundId2Name is populated during NewControlPlane before the control
+	// plane is published and is read-only afterwards, so concurrent readers
+	// (health callbacks, logging) need no lock.
 	outboundId2Name map[uint8]string
+	// tcpSockmapOffloadReady is set once setupTCPRelayOffload attaches the
+	// sk_skb stream-verdict program to fast_sock (kernel passes the
+	// CVE-2025-38165 gate). tryOffloadTCPRelay consults it per relay.
+	tcpSockmapOffloadReady atomic.Bool
 
 	kernelVersion *internal.Version
 
-	flip       int
-	isReload   bool
+	// Reload generation state. flip and isReload are fixed at construction.
+	// flipBase/flipPending reject stale serialized handoffs independently of
+	// the HookSet's fixed classic handles; they are mutated only by reload
+	// handoff steps (commitBpfHookFlip, rollbackCommittedBpfHookFlip,
+	// activateBpfHookFlip), which run outside mu.
+	flip        int
+	flipBase    int32
+	flipPending bool
+	isReload    bool
+	// bpfEjected/bpfOwned are the BPF ownership flags; both are guarded by mu
+	// (EjectBpf, InjectBpf, Close).
 	bpfEjected bool
+	// bpfHooksDetached and bpfHooksQuiesced are guarded by bpfHookMu (not mu):
+	// hook registration and SIGTERM detaching run outside mu to avoid deadlock
+	// with _bindLan/_bindWan callers holding mu.
+	bpfHooksDetached bool // Track if BPF hooks were already detached
+	bpfHooksQuiesced bool
+	retired          atomic.Bool
+	// outboundConnectivityMu serializes shared BPF connectivity-map ownership
+	// with health callbacks while a prepared generation is cut over or rolled back.
+	outboundConnectivityMu sync.Mutex
+	// outboundConnectivityPaused is guarded by outboundConnectivityMu.
+	outboundConnectivityPaused bool
 
-	closed context.Context
-	close  context.CancelFunc
-	ifmgr  *component.InterfaceManager
+	closed                context.Context
+	close                 context.CancelFunc
+	ifmgr                 *component.InterfaceManager
+	interfacePatternMu    sync.Mutex
+	registeredLanPatterns map[string]struct{}
+	registeredWanPatterns map[string]struct{}
+	tcHookLanPatterns     []string
+	tcHookWanPatterns     []string
+	// bindStateMu guards bindStates (per-link bind outcomes, lazily created).
+	// bindAttempts/bindFailures are the magnitude counters for datapath binds;
+	// see logBindOutcome in control_plane_core_bind_event.go.
+	bindStateMu  sync.Mutex
+	bindStates   map[bindEventKey]*bindEventState
+	bindAttempts atomic.Uint64
+	bindFailures atomic.Uint64
+
+	udpConnStateTracker       atomic.Pointer[udpConnStateTracker]
+	domainRouting             *domainRoutingTracker
+	domainRoutingSlots        [routingEpochSlotCount]*domainRoutingTracker
+	domainRoutingProjectionMu [routingEpochSlotCount]sync.RWMutex
+	routingEpochMu            sync.Mutex
+	routingEpochSlot          atomic.Uint32
+	routingEpochPreviousSlot  atomic.Uint32
+	routingEpochRollbackOff   atomic.Bool
+	routingEpochPolicyEpoch   atomic.Uint64
+	datapathGeneration        atomic.Uint32
+	// routingEpochStaged* records the slot/epoch prepared by StageRoutingEpoch
+	// for cutover or rollback decisions. All three fields are guarded by
+	// routingEpochMu (see the *RoutingEpochLocked helpers and their callers);
+	// routingEpochStagedSlot is also seeded during construction before the
+	// core is published.
+	routingEpochStaged      bool
+	routingEpochStagedSlot  uint32
+	routingEpochStagedEpoch uint64
+	// routingEpochActiveSlotCache short-circuits readActiveRoutingEpochSlot.
+	// The active slot only changes on PublishRoutingEpoch/RollbackRoutingEpoch,
+	// so the per-packet eBPF lookup on the UDP hot path is pure waste
+	// (measured ~15% CPU under saturated UDP ingress). One immutable snapshot
+	// also keeps the slot and freshness metadata generation-consistent.
+	routingEpochActiveSlotCache atomic.Pointer[routingEpochActiveSlotSnapshot]
+	// lpmTrieIndices holds the LPM array-map slot indices owned by this
+	// generation. Guarded by mu: Close deletes them, and
+	// buildRoutingKernspaceForSlot/ReplaceLpmIndices rewrite them under the
+	// same lock so map rollback and slot cleanup cannot interleave.
+	lpmTrieIndices []uint32
+	bpfOwned       bool
 }
 
 func newControlPlaneCore(log *logrus.Logger,
@@ -54,657 +226,450 @@ func newControlPlaneCore(log *logrus.Logger,
 	outboundId2Name map[uint8]string,
 	kernelVersion *internal.Version,
 	isReload bool,
+	bpfOwned bool,
 ) *controlPlaneCore {
+	configureNetlinkSocketTimeoutOnce.Do(func() {
+		if err := netlink.SetSocketTimeout(controlPlaneDeferredCleanupTimeout); err != nil && log != nil {
+			log.WithError(err).Warn("Failed to configure netlink socket timeout")
+		}
+	})
+
+	var flip int
+	var flipBase int32
+	var flipPending bool
 	if isReload {
-		coreFlip = coreFlip&1 ^ 1
+		flipBase = atomic.LoadInt32(&coreFlip) & 1
+		flip = int(flipBase ^ 1)
+		flipPending = true
+	} else {
+		flip = int(atomic.LoadInt32(&coreFlip))
 	}
 	var deferFuncs []func() error
-	if !isReload {
-		deferFuncs = append(deferFuncs, bpf.Close)
-	}
 	closed, toClose := context.WithCancel(context.Background())
 	ifmgr := component.NewInterfaceManager(log)
 	deferFuncs = append(deferFuncs, ifmgr.Close)
-	return &controlPlaneCore{
-		log:             log,
-		deferFuncs:      deferFuncs,
-		bpf:             bpf,
-		outboundId2Name: outboundId2Name,
-		kernelVersion:   kernelVersion,
-		flip:            coreFlip,
-		isReload:        isReload,
-		bpfEjected:      false,
-		ifmgr:           ifmgr,
-		closed:          closed,
-		close:           toClose,
+	core := &controlPlaneCore{
+		log:                   log,
+		deferFuncs:            deferFuncs,
+		bpfHookDetachFuncs:    make([]func() error, 0),
+		tcHooks:               newTCHookSet(log),
+		outboundId2Name:       outboundId2Name,
+		kernelVersion:         kernelVersion,
+		flip:                  flip,
+		flipBase:              flipBase,
+		flipPending:           flipPending,
+		isReload:              isReload,
+		bpfEjected:            false,
+		bpfHooksDetached:      false,
+		bpfHooksQuiesced:      false,
+		ifmgr:                 ifmgr,
+		registeredLanPatterns: make(map[string]struct{}),
+		registeredWanPatterns: make(map[string]struct{}),
+		closed:                closed,
+		close:                 toClose,
+		domainRouting:         newDomainRoutingTracker(),
+		bpfOwned:              bpfOwned,
+	}
+	core.domainRoutingSlots[0] = core.domainRouting
+	core.domainRoutingSlots[1] = newDomainRoutingTracker()
+	core.routingEpochSlot.Store(routingEpochSlotUnset)
+	core.routingEpochPreviousSlot.Store(routingEpochSlotUnset)
+	core.routingEpochStagedSlot = routingEpochSlotUnset
+	core.datapathGeneration.Store(uint32(bpfDatapathGeneration(bpf)))
+	core.bpf.Store(bpf)
+	core.udpConnStateTracker.Store(acquireSharedUdpConnStateTracker(bpf))
+	core.addDeferFunc(core.closeOwnedTCHookSet)
+	core.startIfindexWatcher()
+	return core
+}
+
+func (c *controlPlaneCore) commitBpfHookFlip() error {
+	if c == nil || !c.flipPending {
+		return nil
+	}
+	if !atomic.CompareAndSwapInt32(&coreFlip, c.flipBase, int32(c.flip)) {
+		return fmt.Errorf("BPF hook flip changed during reload: active=%d expected=%d", atomic.LoadInt32(&coreFlip)&1, c.flipBase)
+	}
+	c.flipPending = false
+	return nil
+}
+
+func (c *controlPlaneCore) rollbackCommittedBpfHookFlip() error {
+	if c == nil || c.flipPending || !c.isReload {
+		return nil
+	}
+	active := atomic.LoadInt32(&coreFlip) & 1
+	if active == c.flipBase {
+		c.flipPending = true
+		return nil
+	}
+	if active != int32(c.flip) {
+		return fmt.Errorf("BPF hook flip changed before rollback: active=%d candidate=%d previous=%d", active, c.flip, c.flipBase)
+	}
+	if !atomic.CompareAndSwapInt32(&coreFlip, int32(c.flip), c.flipBase) {
+		return fmt.Errorf("BPF hook flip changed during rollback: active=%d candidate=%d previous=%d", atomic.LoadInt32(&coreFlip)&1, c.flip, c.flipBase)
+	}
+	c.flipPending = true
+	return nil
+}
+
+func (c *controlPlaneCore) activateBpfHookFlip() {
+	if c == nil {
+		return
+	}
+	atomic.StoreInt32(&coreFlip, int32(c.flip))
+	c.flipBase = int32(c.flip)
+	c.flipPending = false
+}
+
+func (c *controlPlaneCore) getUdpConnStateTracker() *udpConnStateTracker {
+	if c == nil {
+		return nil
+	}
+	if tracker := c.udpConnStateTracker.Load(); tracker != nil {
+		return tracker
+	}
+	tracker := acquireSharedUdpConnStateTracker(c.bpf.Load())
+	if c.udpConnStateTracker.CompareAndSwap(nil, tracker) {
+		return tracker
+	}
+	releaseSharedUdpConnStateTracker(c.bpf.Load(), tracker)
+	return c.udpConnStateTracker.Load()
+}
+
+// addBpfHookDetach adds a BPF hook detachment function to the dedicated list.
+// These functions will be executed immediately on SIGTERM before other cleanup.
+// Uses bpfHookMu to avoid deadlock with c.mu held by callers like _bindLan/_bindWan.
+func (c *controlPlaneCore) addBpfHookDetach(detachFunc func() error) bool {
+	c.bpfHookMu.Lock()
+	defer c.bpfHookMu.Unlock()
+	if c.bpfHooksQuiesced {
+		return false
+	}
+	c.bpfHookDetachFuncs = append(c.bpfHookDetachFuncs, detachFunc)
+	return true
+}
+
+func (c *controlPlaneCore) beginBpfHookAttach() bool {
+	c.bpfHookMu.Lock()
+	defer c.bpfHookMu.Unlock()
+	if c.bpfHooksQuiesced {
+		return false
+	}
+	c.bpfHookAttachWg.Add(1)
+	return true
+}
+
+func (c *controlPlaneCore) endBpfHookAttach() {
+	c.bpfHookAttachWg.Done()
+}
+
+func (c *controlPlaneCore) addDeferFunc(deferFunc func() error) bool {
+	c.deferMu.Lock()
+	defer c.deferMu.Unlock()
+	select {
+	case <-c.closed.Done():
+		return false
+	default:
+	}
+	c.deferFuncs = append(c.deferFuncs, deferFunc)
+	return true
+}
+
+// addManagedBpfHookCleanup registers hook cleanup for both regular close and
+// immediate detach paths. Hook cleanup must remain active after EjectBpf():
+// ownership transfer only skips bpf.Close(), not removal of this generation's
+// TC filters from the system.
+func (c *controlPlaneCore) addManagedBpfHookCleanup(detachFunc func() error) {
+	var (
+		cleanupMu sync.Mutex
+		detached  bool
+	)
+	managedDetach := func() error {
+		cleanupMu.Lock()
+		defer cleanupMu.Unlock()
+		if detached {
+			return nil
+		}
+		if err := detachFunc(); err != nil {
+			return err
+		}
+		detached = true
+		return nil
+	}
+
+	if !c.addDeferFunc(managedDetach) {
+		if err := managedDetach(); err != nil && c.log != nil {
+			c.log.WithError(err).Warn("controlPlaneCore: failed to detach hook after close began")
+		}
+		return
+	}
+	if !c.addBpfHookDetach(managedDetach) {
+		if err := managedDetach(); err != nil && c.log != nil {
+			c.log.WithError(err).Warn("controlPlaneCore: failed to detach hook registered after detach began")
+		}
 	}
 }
 
-func (c *controlPlaneCore) Flip() {
-	coreFlip = coreFlip&1 ^ 1
+func (c *controlPlaneCore) resetBpfHookDetachForReattach() {
+	c.resetTCHookSetForReattach()
+	c.bpfHookMu.Lock()
+	c.bpfHookDetachFuncs = nil
+	c.bpfHooksDetached = false
+	c.bpfHooksQuiesced = false
+	c.bpfHookMu.Unlock()
+
+	c.interfacePatternMu.Lock()
+	oldIfmgr := c.ifmgr
+	c.ifmgr = component.NewInterfaceManager(c.log)
+	c.registeredLanPatterns = make(map[string]struct{})
+	c.registeredWanPatterns = make(map[string]struct{})
+	newIfmgr := c.ifmgr
+	c.interfacePatternMu.Unlock()
+	if oldIfmgr != nil {
+		_ = oldIfmgr.Close()
+	}
+	// addDeferFunc refuses registration once the core is closed (its
+	// deferFuncs already ran); without this check the fresh ifmgr — a
+	// netlink socket plus its monitor/worker goroutines — would leak.
+	if !c.addDeferFunc(newIfmgr.Close) {
+		_ = newIfmgr.Close()
+	}
 }
+
+// DetachBpfHooks quiesces hook attachment and synchronously detaches every hook
+// owned by this core. Shutdown and failed staged commits both use this operation.
+// It is safe to call multiple times; later calls are no-ops after full success.
+func (c *controlPlaneCore) DetachBpfHooks() error {
+	c.bpfHookDetachMu.Lock()
+	defer c.bpfHookDetachMu.Unlock()
+
+	c.bpfHookMu.Lock()
+	if c.bpfHooksDetached {
+		c.bpfHookMu.Unlock()
+		return nil
+	}
+	c.bpfHooksQuiesced = true
+	c.bpfHookMu.Unlock()
+	if c.ifmgr != nil {
+		_ = c.ifmgr.Close()
+	}
+	c.bpfHookAttachWg.Wait()
+
+	c.bpfHookMu.Lock()
+	defer c.bpfHookMu.Unlock()
+
+	c.log.Infoln("[BPF] Detaching owned hooks")
+
+	var errs []error
+	if e := c.closeOwnedTCHookSet(); e != nil {
+		c.log.WithError(e).Warnln("[BPF] Failed to detach owned TC HookSet")
+		errs = append(errs, e)
+	}
+	// Execute in reverse order (last attached, first detached)
+	for i := len(c.bpfHookDetachFuncs) - 1; i >= 0; i-- {
+		if e := c.bpfHookDetachFuncs[i](); e != nil {
+			// Log but continue detaching other hooks
+			c.log.WithError(e).Warnln("[BPF] Failed to detach owned hook")
+			errs = append(errs, e)
+		}
+	}
+
+	if len(errs) > 0 {
+		c.bpfHooksDetached = false
+		return errors.Join(errs...)
+	}
+	c.bpfHookDetachFuncs = nil
+	c.bpfHooksDetached = true
+	c.log.Infoln("[BPF] Owned hooks detached")
+	return nil
+}
+
 func (c *controlPlaneCore) Close() (err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	bpf := c.bpf.Load()
 	select {
 	case <-c.closed.Done():
 		return nil
 	default:
 	}
-	// Invoke defer funcs in reverse order.
-	for i := len(c.deferFuncs) - 1; i >= 0; i-- {
-		if e := c.deferFuncs[i](); e != nil {
-			// Combine errors.
-			if err != nil {
-				err = fmt.Errorf("%w; %v", err, e)
-			} else {
-				err = e
+	// Invoke defer funcs in reverse order and collect errors.
+	// Use errors.Join (Go 1.20+) for clean multi-error handling.
+	var errs []error
+	// Clear LPM slots still owned by this generation. Retired generations hand
+	// their slots to the next generation before draining so they cannot delete a
+	// slot that has already been reused by a later reload.
+	if bpf != nil && bpf.LpmArrayMap != nil && len(c.lpmTrieIndices) > 0 {
+		for _, idx := range c.lpmTrieIndices {
+			if e := bpf.LpmArrayMap.Delete(idx); e != nil && !errors.Is(e, ebpf.ErrKeyNotExist) {
+				c.log.Errorf("Failed to clear BPF LPM slot %d: %v", idx, e)
 			}
 		}
 	}
 	c.close()
-	return err
-}
+	c.deferMu.Lock()
+	deferFuncs := append([]func() error(nil), c.deferFuncs...)
+	c.deferFuncs = nil
+	c.deferMu.Unlock()
 
-func getIfParamsFromLink(link netlink.Link) (ifParams bpfIfParams, err error) {
-	// Get link offload features.
-	et, err := ethtool.NewEthtool()
-	if err != nil {
-		return bpfIfParams{}, err
-	}
-	defer et.Close()
-	features, err := et.Features(link.Attrs().Name)
-	if err != nil {
-		return bpfIfParams{}, err
-	}
-	if features["tx-checksum-ip-generic"] {
-		ifParams.TxL4CksmIp4Offload = true
-		ifParams.TxL4CksmIp6Offload = true
-	}
-	if features["tx-checksum-ipv4"] {
-		ifParams.TxL4CksmIp4Offload = true
-	}
-	if features["tx-checksum-ipv6"] {
-		ifParams.TxL4CksmIp6Offload = true
-	}
-	if features["rx-checksum"] {
-		ifParams.RxCksmOffload = true
-	}
-	switch {
-	case regexp.MustCompile(`^docker\d+$`).MatchString(link.Attrs().Name):
-		ifParams.UseNonstandardOffloadAlgorithm = true
-	default:
-	}
-	return ifParams, nil
-}
-
-func (c *controlPlaneCore) linkHdrLen(ifname string) (uint32, error) {
-	link, err := netlink.LinkByName(ifname)
-	if err != nil {
-		return 0, err
-	}
-	var linkHdrLen uint32
-	switch link.Attrs().EncapType {
-	case "none", "ipip", "ppp", "tun":
-		linkHdrLen = consts.LinkHdrLen_None
-	case "ether":
-		linkHdrLen = consts.LinkHdrLen_Ethernet
-	default:
-		c.log.Warnf("Maybe unsupported link type %v, using default link header length", link.Attrs().EncapType)
-		linkHdrLen = consts.LinkHdrLen_Ethernet
-	}
-	return linkHdrLen, nil
-}
-
-func (c *controlPlaneCore) addQdisc(ifname string) error {
-	link, err := netlink.LinkByName(ifname)
-	if err != nil {
-		return err
-	}
-	qdisc := &netlink.GenericQdisc{
-		QdiscAttrs: netlink.QdiscAttrs{
-			LinkIndex: link.Attrs().Index,
-			Handle:    netlink.MakeHandle(0xffff, 0),
-			Parent:    netlink.HANDLE_CLSACT,
-		},
-		QdiscType: "clsact",
-	}
-	if err := netlink.QdiscAdd(qdisc); err != nil {
-		return fmt.Errorf("cannot add clsact qdisc: %w", err)
-	}
-	return nil
-}
-
-func (c *controlPlaneCore) delQdisc(ifname string) error {
-	link, err := netlink.LinkByName(ifname)
-	if err != nil {
-		return err
-	}
-	qdisc := &netlink.GenericQdisc{
-		QdiscAttrs: netlink.QdiscAttrs{
-			LinkIndex: link.Attrs().Index,
-			Handle:    netlink.MakeHandle(0xffff, 0),
-			Parent:    netlink.HANDLE_CLSACT,
-		},
-		QdiscType: "clsact",
-	}
-	if err := netlink.QdiscDel(qdisc); err != nil {
-		if !os.IsExist(err) {
-			return fmt.Errorf("cannot add clsact qdisc: %w", err)
+	for i := len(deferFuncs) - 1; i >= 0; i-- {
+		if e := deferFuncs[i](); e != nil {
+			errs = append(errs, e)
 		}
 	}
-	return nil
-}
 
-// bindLan automatically configures kernel parameters and bind to lan interface `ifname`.
-// bindLan supports lazy-bind if interface `ifname` is not found.
-// bindLan supports rebinding when the interface `ifname` is detected in the future.
-func (c *controlPlaneCore) bindLan(ifname string, autoConfigKernelParameter bool) {
-	initlinkCallback := func(link netlink.Link) {
-		if link.Attrs().Name == HostVethName {
-			return
+	if c.bpfOwned && bpf != nil {
+		stopBpfMaintenanceRuntime(bpf)
+		if e := bpf.Close(); e != nil {
+			errs = append(errs, e)
 		}
-		if autoConfigKernelParameter {
-			SetSendRedirects(link.Attrs().Name, "0")
-			SetForwarding(link.Attrs().Name, "1")
-		}
-		if err := c._bindLan(link.Attrs().Name); err != nil {
-			c.log.Errorf("bindLan: %v", err)
-		}
+		unregisterBpfDatapathGeneration(bpf)
 	}
-	newlinkCallback := func(link netlink.Link) {
-		if link.Attrs().Name == HostVethName {
-			return
-		}
-		c.log.Warnf("New link creation of '%v' is detected. Bind LAN program to it.", link.Attrs().Name)
-		if err := c.addQdisc(link.Attrs().Name); err != nil {
-			c.log.Errorf("addQdisc: %v", err)
-			return
-		}
-		initlinkCallback(link)
-	}
-	dellinkCallback := func(link netlink.Link) {
-		if link.Attrs().Name == HostVethName {
-			return
-		}
-		c.log.Warnf("Link deletion of '%v' is detected. Bind LAN program to it once it is re-created.", link.Attrs().Name)
-	}
-	c.ifmgr.RegisterWithPattern(ifname, initlinkCallback, newlinkCallback, dellinkCallback)
-}
-
-func (c *controlPlaneCore) _bindLan(ifname string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	select {
-	case <-c.closed.Done():
-		return nil
-	default:
-	}
-	c.log.Infof("Bind to LAN: %v", ifname)
-
-	link, err := netlink.LinkByName(ifname)
-	if err != nil {
-		return err
-	}
-	if err = CheckIpforward(ifname); err != nil {
-		return err
-	}
-	if err = CheckSendRedirects(ifname); err != nil {
-		return err
-	}
-	_ = c.addQdisc(ifname)
-	linkHdrLen, err := c.linkHdrLen(ifname)
-	if err != nil {
-		return err
-	}
-	/// Insert an elem into IfindexParamsMap.
-	ifParams, err := getIfParamsFromLink(link)
-	if err != nil {
-		return err
-	}
-	if err = ifParams.CheckVersionRequirement(c.kernelVersion); err != nil {
-		return err
-	}
-	if err := c.bpf.IfindexParamsMap.Update(uint32(link.Attrs().Index), ifParams, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("update IfindexIpsMap: %w", err)
+	if tracker := c.udpConnStateTracker.Swap(nil); tracker != nil {
+		releaseSharedUdpConnStateTracker(bpf, tracker)
 	}
 
-	// Insert filters.
-	filterIngress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_INGRESS,
-			Handle:    netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)),
-			Protocol:  unix.ETH_P_ALL,
-			// Priority should be behind of WAN's
-			Priority: 2,
-		},
-		Name:         consts.AppName + "_lan_ingress",
-		DirectAction: true,
-	}
-	if linkHdrLen > 0 {
-		filterIngress.Fd = c.bpf.bpfPrograms.TproxyLanIngressL2.FD()
-		filterIngress.Name = filterIngress.Name + "_l2"
-	} else {
-		filterIngress.Fd = c.bpf.bpfPrograms.TproxyLanIngressL3.FD()
-		filterIngress.Name = filterIngress.Name + "_l3"
-	}
-	// Remove and add.
-	_ = netlink.FilterDel(filterIngress)
-	if !c.isReload {
-		// Clean up thoroughly.
-		filterIngressFlipped := deepcopy.Copy(filterIngress).(*netlink.BpfFilter)
-		filterIngressFlipped.FilterAttrs.Handle ^= 1
-		_ = netlink.FilterDel(filterIngressFlipped)
-	}
-	if err := netlink.FilterAdd(filterIngress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
-	}
-	c.deferFuncs = append(c.deferFuncs, func() error {
-		if err := netlink.FilterDel(filterIngress); err != nil {
-			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterIngress.Name, err)
-		}
-		return nil
-	})
-
-	filterEgress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_EGRESS,
-			Handle:    netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)),
-			Protocol:  unix.ETH_P_ALL,
-			// Priority should be front of WAN's
-			Priority: 1,
-		},
-		Name:         consts.AppName + "_lan_egress",
-		DirectAction: true,
-	}
-	if linkHdrLen > 0 {
-		filterEgress.Fd = c.bpf.bpfPrograms.TproxyLanEgressL2.FD()
-		filterEgress.Name = filterEgress.Name + "_l2"
-	} else {
-		filterEgress.Fd = c.bpf.bpfPrograms.TproxyLanEgressL3.FD()
-		filterEgress.Name = filterEgress.Name + "_l3"
-	}
-	// Remove and add.
-	_ = netlink.FilterDel(filterEgress)
-	if !c.isReload {
-		// Clean up thoroughly.
-		filterEgressFlipped := deepcopy.Copy(filterEgress).(*netlink.BpfFilter)
-		filterEgressFlipped.FilterAttrs.Handle ^= 1
-		_ = netlink.FilterDel(filterEgressFlipped)
-	}
-	if err := netlink.FilterAdd(filterEgress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
-	}
-	c.deferFuncs = append(c.deferFuncs, func() error {
-		if err := netlink.FilterDel(filterEgress); err != nil {
-			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterEgress.Name, err)
-		}
-		return nil
-	})
-
-	return nil
-}
-
-func (c *controlPlaneCore) setupSkPidMonitor() error {
-	/// Set-up SrcPidMapper.
-	/// Attach programs to support pname routing.
-	// Get the first-mounted cgroupv2 path.
-	cgroupPath, err := detectCgroupPath()
-	if err != nil {
-		return err
-	}
-	// Bind cg programs
-	type cgProg struct {
-		Name   string
-		Prog   *ebpf.Program
-		Attach ebpf.AttachType
-	}
-	cgProgs := []cgProg{
-		{Prog: c.bpf.TproxyWanCgSockCreate, Attach: ebpf.AttachCGroupInetSockCreate},
-		{Prog: c.bpf.TproxyWanCgSockRelease, Attach: ebpf.AttachCgroupInetSockRelease},
-		{Prog: c.bpf.TproxyWanCgConnect4, Attach: ebpf.AttachCGroupInet4Connect},
-		{Prog: c.bpf.TproxyWanCgConnect6, Attach: ebpf.AttachCGroupInet6Connect},
-		{Prog: c.bpf.TproxyWanCgSendmsg4, Attach: ebpf.AttachCGroupUDP4Sendmsg},
-		{Prog: c.bpf.TproxyWanCgSendmsg6, Attach: ebpf.AttachCGroupUDP6Sendmsg},
-	}
-	for _, prog := range cgProgs {
-		attached, err := ciliumLink.AttachCgroup(ciliumLink.CgroupOptions{
-			Path:    cgroupPath,
-			Attach:  prog.Attach,
-			Program: prog.Prog,
-		})
-		if err != nil {
-			return fmt.Errorf("AttachCgroup: %v: %w", prog.Prog.String(), err)
-		}
-		c.deferFuncs = append(c.deferFuncs, func() error {
-			if err := attached.Close(); err != nil {
-				return fmt.Errorf("inet6Bind.Close(): %w", err)
-			}
-			return nil
-		})
-	}
-	return nil
-}
-
-// bindWan supports lazy-bind if interface `ifname` is not found.
-// bindWan supports rebinding when the interface `ifname` is detected in the future.
-func (c *controlPlaneCore) bindWan(ifname string, autoConfigKernelParameter bool) {
-	initlinkCallback := func(link netlink.Link) {
-		if link.Attrs().Name == HostVethName {
-			return
-		}
-		if err := c._bindWan(link.Attrs().Name); err != nil {
-			c.log.Errorf("bindWan: %v", err)
-		}
-	}
-	newlinkCallback := func(link netlink.Link) {
-		if link.Attrs().Name == HostVethName {
-			return
-		}
-		c.log.Warnf("New link creation of '%v' is detected. Bind WAN program to it.", link.Attrs().Name)
-		if err := c.addQdisc(link.Attrs().Name); err != nil {
-			c.log.Errorf("addQdisc: %v", err)
-			return
-		}
-		initlinkCallback(link)
-	}
-	dellinkCallback := func(link netlink.Link) {
-		if link.Attrs().Name == HostVethName {
-			return
-		}
-		c.log.Warnf("Link deletion of '%v' is detected. Bind WAN program to it once it is re-created.", link.Attrs().Name)
-	}
-	c.ifmgr.RegisterWithPattern(ifname, initlinkCallback, newlinkCallback, dellinkCallback)
-}
-
-func (c *controlPlaneCore) _bindWan(ifname string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	select {
-	case <-c.closed.Done():
-		return nil
-	default:
-	}
-	c.log.Infof("Bind to WAN: %v", ifname)
-	link, err := netlink.LinkByName(ifname)
-	if err != nil {
-		return err
-	}
-	if link.Attrs().Index == consts.LoopbackIfIndex {
-		return fmt.Errorf("cannot bind to loopback interface")
-	}
-	_ = c.addQdisc(ifname)
-	linkHdrLen, err := c.linkHdrLen(ifname)
-	if err != nil {
-		return err
-	}
-
-	/// Insert an elem into IfindexParamsMap.
-	ifParams, err := getIfParamsFromLink(link)
-	if err != nil {
-		return err
-	}
-	if err = ifParams.CheckVersionRequirement(c.kernelVersion); err != nil {
-		return err
-	}
-	if err := c.bpf.IfindexParamsMap.Update(uint32(link.Attrs().Index), ifParams, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("update IfindexIpsMap: %w", err)
-	}
-
-	/// Set-up WAN ingress/egress TC programs.
-	// Insert TC filters
-	filterEgress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_EGRESS,
-			Handle:    netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)),
-			Protocol:  unix.ETH_P_ALL,
-			Priority:  2,
-		},
-		Name:         consts.AppName + "_wan_egress",
-		DirectAction: true,
-	}
-	if linkHdrLen > 0 {
-		filterEgress.Fd = c.bpf.bpfPrograms.TproxyWanEgressL2.FD()
-		filterEgress.Name = filterEgress.Name + "_l2"
-	} else {
-		filterEgress.Fd = c.bpf.bpfPrograms.TproxyWanEgressL3.FD()
-		filterEgress.Name = filterEgress.Name + "_l3"
-	}
-	_ = netlink.FilterDel(filterEgress)
-	// Remove and add.
-	if !c.isReload {
-		// Clean up thoroughly.
-		filterEgressFlipped := deepcopy.Copy(filterEgress).(*netlink.BpfFilter)
-		filterEgressFlipped.FilterAttrs.Handle ^= 1
-		_ = netlink.FilterDel(filterEgressFlipped)
-	}
-	if err := netlink.FilterAdd(filterEgress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
-	}
-	c.deferFuncs = append(c.deferFuncs, func() error {
-		if err := netlink.FilterDel(filterEgress); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterEgress.Name, err)
-		}
-		return nil
-	})
-
-	filterIngress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_INGRESS,
-			Handle:    netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)),
-			Protocol:  unix.ETH_P_ALL,
-			Priority:  1,
-		},
-		Name:         consts.AppName + "_wan_ingress",
-		DirectAction: true,
-	}
-	if linkHdrLen > 0 {
-		filterIngress.Fd = c.bpf.bpfPrograms.TproxyWanIngressL2.FD()
-		filterIngress.Name = filterIngress.Name + "_l2"
-	} else {
-		filterIngress.Fd = c.bpf.bpfPrograms.TproxyWanIngressL3.FD()
-		filterIngress.Name = filterIngress.Name + "_l3"
-	}
-	_ = netlink.FilterDel(filterIngress)
-	// Remove and add.
-	if !c.isReload {
-		// Clean up thoroughly.
-		filterIngressFlipped := deepcopy.Copy(filterIngress).(*netlink.BpfFilter)
-		filterIngressFlipped.FilterAttrs.Handle ^= 1
-		_ = netlink.FilterDel(filterIngressFlipped)
-	}
-	if err := netlink.FilterAdd(filterIngress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
-	}
-	c.deferFuncs = append(c.deferFuncs, func() error {
-		if err := netlink.FilterDel(filterIngress); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterIngress.Name, err)
-		}
-		return nil
-	})
-
-	return nil
-}
-
-func (c *controlPlaneCore) bindDaens() (err error) {
-	daens := GetDaeNetns()
-
-	// tproxy_dae0peer_ingress@eth0 at dae netns
-	daens.With(func() error {
-		return c.addQdisc(daens.Dae0Peer().Attrs().Name)
-	})
-	filterDae0peerIngress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: daens.Dae0Peer().Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_INGRESS,
-			Handle:    netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)),
-			Protocol:  unix.ETH_P_ALL,
-			Priority:  0,
-		},
-		Fd:           c.bpf.bpfPrograms.TproxyDae0peerIngress.FD(),
-		Name:         consts.AppName + "_dae0peer_ingress",
-		DirectAction: true,
-	}
-	daens.With(func() error {
-		return netlink.FilterDel(filterDae0peerIngress)
-	})
-	// Remove and add.
-	if !c.isReload {
-		// Clean up thoroughly.
-		filterIngressFlipped := deepcopy.Copy(filterDae0peerIngress).(*netlink.BpfFilter)
-		filterIngressFlipped.FilterAttrs.Handle ^= 1
-		daens.With(func() error {
-			return netlink.FilterDel(filterDae0peerIngress)
-		})
-	}
-	if err = daens.With(func() error {
-		return netlink.FilterAdd(filterDae0peerIngress)
-	}); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
-	}
-	c.deferFuncs = append(c.deferFuncs, func() error {
-		daens.With(func() error {
-			return netlink.FilterDel(filterDae0peerIngress)
-		})
-		return nil
-	})
-
-	// tproxy_dae0_ingress@dae0 at host netns
-	c.addQdisc(daens.Dae0().Attrs().Name)
-	filterDae0Ingress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: daens.Dae0().Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_INGRESS,
-			Handle:    netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)),
-			Protocol:  unix.ETH_P_ALL,
-			Priority:  0,
-		},
-		Fd:           c.bpf.bpfPrograms.TproxyDae0Ingress.FD(),
-		Name:         consts.AppName + "_dae0_ingress",
-		DirectAction: true,
-	}
-	_ = netlink.FilterDel(filterDae0Ingress)
-	// Remove and add.
-	if !c.isReload {
-		// Clean up thoroughly.
-		filterEgressFlipped := deepcopy.Copy(filterDae0Ingress).(*netlink.BpfFilter)
-		filterEgressFlipped.FilterAttrs.Handle ^= 1
-		_ = netlink.FilterDel(filterEgressFlipped)
-	}
-	if err := netlink.FilterAdd(filterDae0Ingress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
-	}
-	c.deferFuncs = append(c.deferFuncs, func() error {
-		if err := netlink.FilterDel(filterDae0Ingress); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("FilterDel(%v:%v): %w", daens.Dae0().Attrs().Name, filterDae0Ingress.Name, err)
-		}
-		return nil
-	})
-	return
-}
-
-// BatchUpdateDomainRouting update bpf map domain_routing. Since one IP may have multiple domains, this function should
-// be invoked every A/AAAA-record lookup.
-func (c *controlPlaneCore) BatchUpdateDomainRouting(cache *DnsCache) error {
-	// Parse ips from DNS resp answers.
-	var ips []netip.Addr
-	for _, ans := range cache.Answer {
-		var (
-			ip netip.Addr
-			ok bool
-		)
-		switch body := ans.(type) {
-		case *dnsmessage.A:
-			ip, ok = netip.AddrFromSlice(body.A)
-		case *dnsmessage.AAAA:
-			ip, ok = netip.AddrFromSlice(body.AAAA)
-		}
-		if !ok || ip.IsUnspecified() {
-			continue
-		}
-		ips = append(ips, ip)
-	}
-	if len(ips) == 0 {
-		return nil
-	}
-
-	// Update bpf map.
-	// Construct keys and vals, and BpfMapBatchUpdate.
-	var keys [][4]uint32
-	var vals []bpfDomainRouting
-	for _, ip := range ips {
-		ip6 := ip.As16()
-		keys = append(keys, common.Ipv6ByteSliceToUint32Array(ip6[:]))
-		r := bpfDomainRouting{}
-		if len(cache.DomainBitmap) != len(r.Bitmap) {
-			return fmt.Errorf("domain bitmap length not sync with kern program")
-		}
-		copy(r.Bitmap[:], cache.DomainBitmap)
-		vals = append(vals, r)
-	}
-	if _, err := BpfMapBatchUpdate(c.bpf.DomainRoutingMap, keys, vals, &ebpf.BatchOptions{
-		ElemFlags: uint64(ebpf.UpdateAny),
-	}); err != nil {
-		return err
-	}
-	return nil
-}
-
-// BatchRemoveDomainRouting remove bpf map domain_routing.
-func (c *controlPlaneCore) BatchRemoveDomainRouting(cache *DnsCache) error {
-	// Parse ips from DNS resp answers.
-	var ips []netip.Addr
-	for _, ans := range cache.Answer {
-		var (
-			ip netip.Addr
-			ok bool
-		)
-		switch body := ans.(type) {
-		case *dnsmessage.A:
-			ip, ok = netip.AddrFromSlice(body.A)
-		case *dnsmessage.AAAA:
-			ip, ok = netip.AddrFromSlice(body.AAAA)
-		}
-		if !ok || ip.IsUnspecified() {
-			continue
-		}
-		ips = append(ips, ip)
-	}
-	if len(ips) == 0 {
-		return nil
-	}
-
-	// Update bpf map.
-	// Construct keys and vals, and BpfMapBatchUpdate.
-	var keys [][4]uint32
-	for _, ip := range ips {
-		ip6 := ip.As16()
-		keys = append(keys, common.Ipv6ByteSliceToUint32Array(ip6[:]))
-	}
-	if _, err := BpfMapBatchDelete(c.bpf.DomainRoutingMap, keys); err != nil {
-		return err
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 	return nil
 }
 
 // EjectBpf will resect bpf from destroying life-cycle of control plane core.
 func (c *controlPlaneCore) EjectBpf() *bpfObjects {
-	if !c.bpfEjected && !c.isReload {
-		c.deferFuncs = c.deferFuncs[1:]
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	bpf := c.bpf.Load()
+	if c.bpfEjected {
+		return bpf
 	}
+
+	// Transfer ownership: this generation is no longer responsible for closing BPF.
+	c.bpfOwned = false
 	c.bpfEjected = true
-	return c.bpf
+
+	// Stop link watcher immediately during handover period to avoid race condition
+	// between old and new control planes reacting to link events (e.g. PPPoE flapping).
+	_ = c.ifmgr.Close()
+
+	return bpf
+}
+
+// buildRoutingKernspaceForSlot builds and records a generation's LPM indices
+// while holding the same core lock used by Close. This keeps map rollback and
+// generation-owned index cleanup from running concurrently.
+func (c *controlPlaneCore) buildRoutingKernspaceForSlot(log *logrus.Logger, snapshot *routingKernspaceSnapshot) error {
+	if c == nil {
+		return fmt.Errorf("nil control plane core")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	indices, err := snapshot.BuildKernspaceForSlot(log, c.bpf.Load(), c.RoutingEpochSlot())
+	if err != nil {
+		return err
+	}
+	c.lpmTrieIndices = append([]uint32(nil), indices...)
+	return nil
+}
+
+// ReplaceLpmIndices installs a new active LPM index set for this generation.
+// Epoch slots own their LPM ring entries until the generation closes, so the
+// superseded set is reclaimed by finalizePreviousRoutingEpoch rather than
+// eagerly here.
+func (c *controlPlaneCore) ReplaceLpmIndices(indices []uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lpmTrieIndices = append([]uint32(nil), indices...)
 }
 
 // InjectBpf will inject bpf back.
 func (c *controlPlaneCore) InjectBpf(bpf *bpfObjects) {
-	if c.bpfEjected {
-		c.bpfEjected = false
-		c.deferFuncs = append([]func() error{bpf.Close}, c.deferFuncs...)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if bpf != nil {
+		c.bpf.Store(bpf)
+		c.datapathGeneration.Store(uint32(bpfDatapathGeneration(bpf)))
 	}
-	return
+	c.bpfEjected = false
+	c.bpfOwned = true
+}
+
+// PeekBpf returns the current BPF objects without transferring ownership.
+// Background maintenance paths such as janitors and health checks should use
+// this accessor instead of EjectBpf to avoid disturbing reload lifecycle.
+func (c *controlPlaneCore) PeekBpf() *bpfObjects {
+	return c.bpf.Load()
+}
+
+// startIfindexWatcher follows link changes that can be handled without a BPF
+// reload: it updates dae_ifindex_map for a recreated dae0 and attaches the
+// direct-stats observer to ports added to a bound bridge.
+func (c *controlPlaneCore) startIfindexWatcher() {
+	ch := make(chan netlink.LinkUpdate)
+	done := make(chan struct{})
+	if err := netlink.LinkSubscribeWithOptions(ch, done, netlink.LinkSubscribeOptions{
+		ErrorCallback: func(err error) {
+			select {
+			case <-c.closed.Done():
+				return
+			default:
+				c.log.Debug("ifindex watcher LinkSubscribe:", err)
+			}
+		},
+		ListExisting: true,
+	}); err != nil {
+		c.log.Errorf("Failed to subscribe to link updates for ifindex watcher: %v", err)
+		return
+	}
+
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-c.closed.Done():
+				// Closing done makes the library close its netlink socket, but
+				// a subscription goroutine already blocked sending an update
+				// (teardown itself bursts RTM_NEWLINK events) never regains a
+				// receiver and leaks. Take over the drain until the socket
+				// close unblocks it and the library closes ch.
+				go func() {
+					for range ch {
+					}
+				}()
+				return
+			case upd, ok := <-ch:
+				if !ok {
+					return
+				}
+				c.handleDirectStatsLinkUpdate(upd)
+				if upd.Link == nil || upd.Attrs() == nil {
+					// A delete event can arrive without a parsed link; the
+					// observer path above already tolerates it.
+					continue
+				}
+				if upd.Link.Attrs().Name != HostVethName {
+					continue
+				}
+				newIfindex := uint32(upd.Link.Attrs().Index)
+				bpf := c.PeekBpf()
+				if bpf == nil || bpf.DaeIfindexMap == nil {
+					continue
+				}
+				var currentIfindex uint32
+				if err := bpf.DaeIfindexMap.Lookup(uint32(0), &currentIfindex); err != nil {
+					currentIfindex = 0
+				}
+				if newIfindex == currentIfindex {
+					continue
+				}
+				if err := bpf.DaeIfindexMap.Update(uint32(0), newIfindex, ebpf.UpdateAny); err != nil {
+					c.log.Errorf("Failed to update dae_ifindex_map: %v", err)
+				} else {
+					c.log.Warnf("dae0 ifindex drift detected and recovered: %d -> %d", currentIfindex, newIfindex)
+				}
+			}
+		}
+	}()
 }

@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 package cmd
@@ -24,7 +24,7 @@ var (
 		Use:   "outline",
 		Short: "To export config structure.",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println(config.ExportOutlineJson(Version))
+			fmt.Println(config.ExportOutlineJson(config.Version))
 		},
 	}
 )

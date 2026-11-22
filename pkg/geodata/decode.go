@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 // Modified from https://github.com/v2fly/v2ray-core/blob/42b166760b2ba8d984e514b830fcd44e23728e43/infra/conf/geodata/memconservative
@@ -8,6 +8,7 @@
 package geodata
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,10 @@ var (
 	errCodeNotFound                 = errors.New("code not found")
 )
 
+// maxGeoEntryLength bounds a single varint-declared record length so that a
+// corrupted or hostile .dat file cannot request a huge allocation.
+const maxGeoEntryLength = 1 << 28 // 256 MiB
+
 func emitBytes(f io.ReadSeeker, code string) ([]byte, error) {
 	count := 1
 	isInner := false
@@ -39,6 +44,9 @@ Loop:
 		container := make([]byte, advancedN)
 		bytesRead, err := f.Read(container)
 		if err == io.EOF {
+			if len(tempContainer) != 0 {
+				return nil, errInvalidGeodataVarintLength
+			}
 			return nil, errCodeNotFound
 		}
 		if err != nil {
@@ -57,6 +65,9 @@ Loop:
 			count++
 		case 2, 4: // data length
 			tempContainer = append(tempContainer, container...)
+			if len(tempContainer) > binary.MaxVarintLen64 {
+				return nil, errInvalidGeodataVarintLength
+			}
 			if container[0] > 127 { // max one-byte-length byte `7F`(0FFF FFFF) equals to `127` in decimal
 				advancedN = 1
 				goto Loop
@@ -69,10 +80,16 @@ Loop:
 			if !isInner {
 				isInner = true
 				geoDataVarintLength = lenVarint
+				if geoDataVarintLength > maxGeoEntryLength {
+					return nil, errInvalidGeodataVarintLength
+				}
 				advancedN = 1
 			} else {
 				isInner = false
 				codeVarintLength = lenVarint
+				if codeVarintLength > maxGeoEntryLength {
+					return nil, errInvalidGeodataVarintLength
+				}
 				varintLenByteLen = uint64(n)
 				advancedN = codeVarintLength
 			}
@@ -81,13 +98,13 @@ Loop:
 			if strings.EqualFold(string(container), code) {
 				count++
 				offset := -(1 + int64(varintLenByteLen) + int64(codeVarintLength))
-				f.Seek(offset, 1)               // back to the start of GeoIP or GeoSite varint
+				_, _ = f.Seek(offset, 1)        // back to the start of GeoIP or GeoSite varint
 				advancedN = geoDataVarintLength // the number of bytes to be read in next round
 			} else {
 				count = 1
 				offset := int64(geoDataVarintLength) - int64(codeVarintLength) - int64(varintLenByteLen) - 1
-				f.Seek(offset, 1) // skip the unmatched GeoIP or GeoSite varint
-				advancedN = 1     // the next round will be the start of another GeoIPList or GeoSiteList
+				_, _ = f.Seek(offset, 1) // skip the unmatched GeoIP or GeoSite varint
+				advancedN = 1            // the next round will be the start of another GeoIPList or GeoSiteList
 			}
 		case 6: // matched GeoIP or GeoSite varint
 			result = container
@@ -102,7 +119,7 @@ func Decode(filename, code string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %v: %w", filename, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	geoBytes, err := emitBytes(f, code)
 	if err != nil {

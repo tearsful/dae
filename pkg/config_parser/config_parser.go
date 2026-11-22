@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 package config_parser
@@ -12,6 +12,15 @@ import (
 )
 
 func Parse(in string) (sections []*Section, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			// The walker contains defensive panics and bare type assertions
+			// that ANTLR error-recovery trees can trip. A malformed config
+			// must surface as a parse error instead of crashing the process.
+			sections = nil
+			err = fmt.Errorf("failed to parse config: unexpected parser state: %v", r)
+		}
+	}()
 	errorListener := NewConsoleErrorListener()
 	lexer := dae_config.Newdae_configLexer(antlr.NewInputStream(in))
 	lexer.RemoveErrorListeners()
