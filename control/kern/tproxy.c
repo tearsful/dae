@@ -2,6 +2,10 @@
 // Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
 
 // +build ignore
+
+// Disable implicit CO-RE from vmlinux.h to bypass bad relocation caused by GCC 15 DTE stripping UAPI structs.
+#define BPF_NO_PRESERVE_ACCESS_INDEX 1
+
 #include "headers/errno-base.h"
 #include "headers/if_ether_defs.h"
 #include "headers/pkt_cls_defs.h"
@@ -59,7 +63,9 @@
 #define MAX_COOKIE_PID_PNAME_MAPPING_NUM (65536)
 #define MAX_DOMAIN_ROUTING_NUM 65536
 #define MAX_ARG_LEN 128
-#define IPV6_MAX_EXTENSIONS 4
+#define IPV6_MAX_EXTENSIONS 8
+
+#define ipv6_optlen(p) (((p)+1) << 3)
 
 #define OUTBOUND_DIRECT 0
 #define OUTBOUND_BLOCK 1
@@ -436,95 +442,56 @@ static __always_inline bool equal16(const __be32 x[4], const __be32 y[4])
 #endif
 }
 
-static __always_inline int
-handle_ipv6_extensions(const struct __sk_buff *skb, __u32 offset, __u32 hdr,
-		       struct icmp6hdr *icmp6h, struct tcphdr *tcph,
-		       struct udphdr *udph, __u8 *ihl, __u8 *l4proto)
+static __always_inline bool is_extension_header(__u8 nexthdr)
 {
-	__u8 hdr_length = 0;
-	__u8 nexthdr = 0;
-	*ihl = sizeof(struct ipv6hdr) / 4;
-	int ret;
-	// We only process TCP and UDP traffic.
-
-	// Unroll can give less instructions but more memory consumption when loading.
-	// We disable it here to support more poor memory devices.
-	// #pragma unroll
-	for (int i = 0; i < IPV6_MAX_EXTENSIONS;
-	     i++, offset += hdr_length, hdr = nexthdr, *ihl += hdr_length / 4) {
-		if (hdr_length % 4) {
-			bpf_printk(
-				"IPv6 extension length is not multiples of 4");
-			return 1;
-		}
-		// See control/control_plane.go.
-
-		switch (hdr) {
-		case IPPROTO_ICMPV6:
-			*l4proto = hdr;
-			hdr_length = sizeof(struct icmp6hdr);
-			// Assume ICMPV6 as a level 4 protocol.
-			ret = bpf_skb_load_bytes(skb, offset, icmp6h,
-						 hdr_length);
-			if (ret) {
-				bpf_printk("not a valid IPv6 packet");
-				return -EFAULT;
-			}
-			return 0;
-
-		case IPPROTO_HOPOPTS:
-		case IPPROTO_ROUTING:
-			ret = bpf_skb_load_bytes(skb, offset + 1, &hdr_length,
-						 sizeof(hdr_length));
-			if (ret) {
-				bpf_printk("not a valid IPv6 packet");
-				return -EFAULT;
-			}
-
-special_n1:
-			ret = bpf_skb_load_bytes(skb, offset, &nexthdr,
-						 sizeof(nexthdr));
-			if (ret) {
-				bpf_printk("not a valid IPv6 packet");
-				return -EFAULT;
-			}
-			break;
-		case IPPROTO_FRAGMENT:
-			hdr_length = 4;
-			goto special_n1;
-		case IPPROTO_TCP:
-		case IPPROTO_UDP:
-			*l4proto = hdr;
-			if (hdr == IPPROTO_TCP) {
-				// Upper layer;
-				ret = bpf_skb_load_bytes(skb, offset, tcph,
-							 sizeof(struct tcphdr));
-				if (ret) {
-					bpf_printk("not a valid IPv6 packet");
-					return -EFAULT;
-				}
-			} else if (hdr == IPPROTO_UDP) {
-				// Upper layer;
-				ret = bpf_skb_load_bytes(skb, offset, udph,
-							 sizeof(struct udphdr));
-				if (ret) {
-					bpf_printk("not a valid IPv6 packet");
-					return -EFAULT;
-				}
-			} else {
-				// Unknown hdr.
-				bpf_printk("Unexpected hdr.");
-				return 1;
-			}
-			return 0;
-		default:
-			/// EXPECTED: Maybe ICMP, etc.
-			// bpf_printk("IPv6 but unrecognized extension protocol: %u", hdr);
-			return 1;
-		}
+	switch (nexthdr) {
+	case IPPROTO_HOPOPTS:
+	case IPPROTO_ROUTING:
+	case IPPROTO_FRAGMENT:
+	case IPPROTO_DSTOPTS:
+		return true;
+	default:
+		return false;
 	}
-	bpf_printk("exceeds IPV6_MAX_EXTENSIONS limit");
-	return 1;
+}
+
+struct ipv6_ext_ctx {
+	const struct __sk_buff *skb;
+	__u32 *offset;
+	__u8 *nexthdr;
+	int result;
+};
+
+static int ipv6_ext_skip_loop_cb(__u32 index, void *data)
+{
+	struct ipv6_ext_ctx *ctx = data;
+
+	if (*ctx->nexthdr == IPPROTO_NONE)
+		return 1;
+
+	if (!is_extension_header(*ctx->nexthdr))
+		return 1;
+
+	int ret = bpf_skb_load_bytes(ctx->skb, *ctx->offset, ctx->nexthdr,
+					 sizeof(*ctx->nexthdr));
+	if (ret) {
+		bpf_printk("not a valid IPv6 packet");
+		ctx->result = -EFAULT;
+		return 1;
+	}
+
+	__u8 hdr_ext_len = 0;
+
+	ret = bpf_skb_load_bytes(ctx->skb, *ctx->offset + 1, &hdr_ext_len,
+				 sizeof(hdr_ext_len));
+	if (ret) {
+		bpf_printk("not a valid IPv6 packet");
+		ctx->result = -EFAULT;
+		return 1;
+	}
+
+	*ctx->offset += ipv6_optlen(hdr_ext_len);
+	return 0;
 }
 
 static __always_inline int
@@ -572,22 +539,22 @@ parse_transport(const struct __sk_buff *skb, __u32 link_h_len,
 		// We only process TCP and UDP traffic.
 		*l4proto = iph->protocol;
 		switch (iph->protocol) {
-		case IPPROTO_TCP: {
+		case IPPROTO_TCP:
 			ret = bpf_skb_load_bytes(skb, offset, tcph,
 						 sizeof(struct tcphdr));
 			if (ret) {
 				// Not a complete tcphdr.
 				return -EFAULT;
 			}
-		} break;
-		case IPPROTO_UDP: {
+			break;
+		case IPPROTO_UDP:
 			ret = bpf_skb_load_bytes(skb, offset, udph,
 						 sizeof(struct udphdr));
 			if (ret) {
 				// Not a complete udphdr.
 				return -EFAULT;
 			}
-		} break;
+			break;
 		default:
 			return 1;
 		}
@@ -602,16 +569,65 @@ parse_transport(const struct __sk_buff *skb, __u32 link_h_len,
 		}
 
 		offset += sizeof(struct ipv6hdr);
+		*ihl = sizeof(struct ipv6hdr) / 4;
+		__u8 nexthdr = ipv6h->nexthdr;
 
-		return handle_ipv6_extensions(skb, offset, ipv6h->nexthdr,
-					      icmp6h, tcph, udph, ihl, l4proto);
-	} else {
-		/// EXPECTED: Maybe ICMP, MPLS, etc.
-		// bpf_printk("IP but not supported packet: protocol is %u",
-		// iph->protocol);
-		// bpf_printk("unknown link proto: %u", bpf_ntohl(skb->protocol));
-		return 1;
+		// Skip all extension headers.
+		struct ipv6_ext_ctx ext_ctx = {
+			.skb = skb,
+			.offset = &offset,
+			.nexthdr = &nexthdr,
+			.result = 0
+		};
+
+		ret = bpf_loop(IPV6_MAX_EXTENSIONS, ipv6_ext_skip_loop_cb, &ext_ctx, 0);
+		if (ret < 0)
+			return ret;
+		if (ext_ctx.result)
+			return ext_ctx.result;
+
+		if (is_extension_header(nexthdr)) {
+			bpf_printk("Unexpected hdr or exceeds IPV6_MAX_EXTENSIONS limit");
+			return 1;
+		}
+
+		*l4proto = nexthdr;
+
+		switch (nexthdr) {
+		case IPPROTO_TCP:
+			ret = bpf_skb_load_bytes(skb, offset, tcph,
+						 sizeof(struct tcphdr));
+			if (ret) {
+				// Not a complete tcphdr.
+				return -EFAULT;
+			}
+			break;
+		case IPPROTO_UDP:
+			ret = bpf_skb_load_bytes(skb, offset, udph,
+						 sizeof(struct udphdr));
+			if (ret) {
+				// Not a complete udphdr.
+				return -EFAULT;
+			}
+			break;
+		case IPPROTO_ICMPV6:
+			ret = bpf_skb_load_bytes(skb, offset, icmp6h,
+						 sizeof(struct icmp6hdr));
+			if (ret) {
+				// Not a complete icmp6hdr.
+				return -EFAULT;
+			}
+			break;
+		default:
+			/// EXPECTED: Maybe ICMP, MPLS, etc.
+			// bpf_printk("IP but not supported packet: protocol is %u",
+			// iph->protocol);
+			return 1;
+		}
+		return 0;
 	}
+	// bpf_printk("unknown link proto: %u", bpf_ntohl(ethh->h_proto));
+	return 1;
 }
 
 struct route_params {
@@ -1030,37 +1046,27 @@ static __always_inline void copy_reversed_tuples(struct tuples_key *key,
 static __always_inline struct udp_conn_state *
 refresh_udp_conn_state_timer(struct tuples_key *key, bool is_wan_ingress_direction)
 {
-	struct udp_conn_state *old_conn_state =
-		bpf_map_lookup_elem(&udp_conn_state_map, key);
-	struct udp_conn_state new_conn_state = { 0 };
+	struct udp_conn_state *state = bpf_map_lookup_elem(&udp_conn_state_map, key);
 
-	if (old_conn_state)
-		new_conn_state.is_wan_ingress_direction =
-			old_conn_state->is_wan_ingress_direction; // Keep the value.
-	else
-		new_conn_state.is_wan_ingress_direction = is_wan_ingress_direction;
-	long ret = bpf_map_update_elem(&udp_conn_state_map, key,
-				       &new_conn_state, BPF_ANY);
-	if (unlikely(ret))
-		return NULL;
-	struct udp_conn_state *value =
-		bpf_map_lookup_elem(&udp_conn_state_map, key);
-	if (unlikely(!value))
+	if (state)
+		goto rearm;
+
+	struct udp_conn_state new_state = {};
+
+	new_state.is_wan_ingress_direction = is_wan_ingress_direction;
+	if (unlikely(bpf_map_update_elem(&udp_conn_state_map, key, &new_state, BPF_NOEXIST)))
 		return NULL;
 
-	if ((bpf_timer_init(&value->timer, &udp_conn_state_map,
-			    CLOCK_MONOTONIC)))
-		goto retn;
+	state = bpf_map_lookup_elem(&udp_conn_state_map, key);
+	if (unlikely(!state))
+		return NULL;
 
-	if ((bpf_timer_set_callback(&value->timer,
-				    refresh_udp_conn_state_timer_cb)))
-		goto retn;
+	bpf_timer_init(&state->timer, &udp_conn_state_map, CLOCK_MONOTONIC);
+	bpf_timer_set_callback(&state->timer, refresh_udp_conn_state_timer_cb);
 
-	if ((bpf_timer_start(&value->timer, TIMEOUT_UDP_CONN_STATE, 0)))
-		goto retn;
-
-retn:
-	return value;
+rearm:
+	bpf_timer_start(&state->timer, TIMEOUT_UDP_CONN_STATE, 0);
+	return state;
 }
 
 SEC("tc/egress")
@@ -1192,6 +1198,13 @@ new_connection:;
 		if (!(tcph.syn && !tcph.ack)) {
 			// Not a new TCP connection.
 			// Perhaps single-arm.
+			// Re-apply fwmark so that non-SYN packets of a direct(mark:N)
+			// flow still follow fwmark-based policy routing.
+			struct routing_result *routing_result =
+				bpf_map_lookup_elem(&routing_tuples_map,
+						    &tuples.five);
+			if (routing_result)
+				skb->mark = routing_result->mark;
 			return TC_ACT_OK;
 		}
 		params.l4hdr = &tcph;
@@ -1396,12 +1409,17 @@ int tproxy_wan_ingress(struct __sk_buff *skb)
 
 // Routing and redirect the packet back.
 // We cannot modify the dest address here. So we cooperate with wan_ingress.
+// Pass-through paths return TC_ACT_PIPE, not TC_ACT_OK, so that other filters
+// attached to the same clsact qdisc still get to see the packet: cls_bpf maps
+// TC_ACT_PIPE to TC_ACT_UNSPEC, which is the only return value that lets
+// __tcf_classify() continue down the filter chain. This matches what
+// wan_ingress and lan_egress already do. (upstream #1087)
 SEC("tc/wan_egress")
 int tproxy_wan_egress(struct __sk_buff *skb)
 {
 	// Skip packets not from localhost.
 	if (skb->ingress_ifindex != NOWHERE_IFINDEX)
-		return TC_ACT_OK;
+		return TC_ACT_PIPE;
 	// if ((skb->mark & 0x80) == 0x80) {
 	//	 return TC_ACT_OK;
 	// }
@@ -1422,9 +1440,9 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 	int ret = parse_transport(skb, link_h_len, &ethh, &iph, &ipv6h, &icmp6h,
 				  &tcph, &udph, &ihl, &l4proto);
 	if (ret)
-		return TC_ACT_OK;
+		return TC_ACT_PIPE;
 	if (l4proto == IPPROTO_ICMPV6)
-		return TC_ACT_OK;
+		return TC_ACT_PIPE;
 
 	// Backup for further use.
 	struct tuples tuples;
@@ -1455,7 +1473,7 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 			params.flag[6] = tuples.dscp;
 			if (pid_is_control_plane(skb, &pid_pname)) {
 				// From control plane. Direct.
-				return TC_ACT_OK;
+				return TC_ACT_PIPE;
 			}
 			if (pid_pname) {
 				// 2, 3, 4, 5
@@ -1503,7 +1521,7 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 
 			if (!routing_result) {
 				// Do not impact previous connections and server connections.
-				return TC_ACT_OK;
+				return TC_ACT_PIPE;
 			}
 			outbound = routing_result->outbound;
 			mark = routing_result->mark;
@@ -1519,7 +1537,7 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 #endif
 
 			skb->mark = mark;
-			return TC_ACT_OK;
+			return TC_ACT_PIPE;
 		} else if (unlikely(outbound == OUTBOUND_BLOCK)) {
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 			bpf_printk("SHOT OUTBOUND_BLOCK");
@@ -1545,22 +1563,26 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 		}
 
 		if (unlikely(tcp_state_syn)) {
-			struct routing_result routing_result = {};
+			// Only save non-direct routing to avoid conflicts with LAN ingress.
+			// Direct traffic doesn't need control plane processing.
+			if (outbound != OUTBOUND_DIRECT || mark != 0 || must) {
+				struct routing_result routing_result = {};
 
-			routing_result.outbound = outbound;
-			routing_result.mark = mark;
-			routing_result.must = must;
-			routing_result.dscp = tuples.dscp;
-			__builtin_memcpy(routing_result.mac, ethh.h_source,
-					 sizeof(ethh.h_source));
-			if (pid_pname) {
-				__builtin_memcpy(routing_result.pname,
-						 pid_pname->pname,
-						 TASK_COMM_LEN);
-				routing_result.pid = pid_pname->pid;
+				routing_result.outbound = outbound;
+				routing_result.mark = mark;
+				routing_result.must = must;
+				routing_result.dscp = tuples.dscp;
+				__builtin_memcpy(routing_result.mac, ethh.h_source,
+						 sizeof(ethh.h_source));
+				if (pid_pname) {
+					__builtin_memcpy(routing_result.pname,
+							 pid_pname->pname,
+							 TASK_COMM_LEN);
+					routing_result.pid = pid_pname->pid;
+				}
+				bpf_map_update_elem(&routing_tuples_map, &tuples.five,
+						    &routing_result, BPF_ANY);
 			}
-			bpf_map_update_elem(&routing_tuples_map, &tuples.five,
-					    &routing_result, BPF_ANY);
 		}
 
 	} else if (l4proto == IPPROTO_UDP) {
@@ -1581,7 +1603,7 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 		if (pid_is_control_plane(skb, &pid_pname)) {
 			// from control plane
 			// => direct.
-			return TC_ACT_OK;
+			return TC_ACT_PIPE;
 		}
 
 		struct udp_conn_state *conn_state =
@@ -1591,7 +1613,7 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 		if (conn_state->is_wan_ingress_direction) {
 			// Replay (outbound) of an inbound flow
 			// => direct.
-			return TC_ACT_OK;
+			return TC_ACT_PIPE;
 		}
 
 		if (pid_pname) {
@@ -1614,22 +1636,31 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 			bpf_printk("shot routing: %d", s64_ret);
 			return TC_ACT_SHOT;
 		}
-		// Construct new hdr to encap.
-		struct routing_result routing_result = {};
+		// Extract routing values.
+		__u8 outbound = s64_ret & 0xff;
+		__u32 mark = s64_ret >> 8;
+		bool must = (s64_ret >> 40) & 1;
 
-		routing_result.outbound = s64_ret;
-		routing_result.mark = s64_ret >> 8;
-		routing_result.must = (s64_ret >> 40) & 1;
-		routing_result.dscp = tuples.dscp;
-		__builtin_memcpy(routing_result.mac, ethh.h_source,
-				 sizeof(ethh.h_source));
-		if (pid_pname) {
-			__builtin_memcpy(routing_result.pname, pid_pname->pname,
-					 TASK_COMM_LEN);
-			routing_result.pid = pid_pname->pid;
+		// Only save non-direct routing to avoid conflicts with LAN ingress.
+		// Direct traffic doesn't need control plane processing.
+		if (outbound != OUTBOUND_DIRECT || mark != 0 || must) {
+			// Construct new hdr to encap.
+			struct routing_result routing_result = {};
+
+			routing_result.outbound = outbound;
+			routing_result.mark = mark;
+			routing_result.must = must;
+			routing_result.dscp = tuples.dscp;
+			__builtin_memcpy(routing_result.mac, ethh.h_source,
+					 sizeof(ethh.h_source));
+			if (pid_pname) {
+				__builtin_memcpy(routing_result.pname, pid_pname->pname,
+						 TASK_COMM_LEN);
+				routing_result.pid = pid_pname->pid;
+			}
+			bpf_map_update_elem(&routing_tuples_map, &tuples.five,
+					    &routing_result, BPF_ANY);
 		}
-		bpf_map_update_elem(&routing_tuples_map, &tuples.five,
-				    &routing_result, BPF_ANY);
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 		__u32 pid = pid_pname ? pid_pname->pid : 0;
 
@@ -1637,17 +1668,17 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 			   tuples.five.sip.u6_addr32,
 			   bpf_ntohs(tuples.five.sport), pid);
 		bpf_printk("udp(wan): outbound: %u, %pI6:%u",
-			   routing_result.outbound, tuples.five.dip.u6_addr32,
+			   outbound, tuples.five.dip.u6_addr32,
 			   bpf_ntohs(tuples.five.dport));
 #endif
 
-		if (routing_result.outbound == OUTBOUND_DIRECT &&
-		    routing_result.mark == 0
+		if (outbound == OUTBOUND_DIRECT &&
+		    mark == 0
 		    // If mark is not zero, we should re-route it, so we send it to control
 		    // plane in WAN.
 		) {
-			return TC_ACT_OK;
-		} else if (unlikely(routing_result.outbound ==
+			return TC_ACT_PIPE;
+		} else if (unlikely(outbound ==
 				    OUTBOUND_BLOCK)) {
 			return TC_ACT_SHOT;
 		}
@@ -1657,7 +1688,7 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 		// Check outbound connectivity in specific ipversion and l4proto.
 		struct outbound_connectivity_query q = { 0 };
 
-		q.outbound = routing_result.outbound;
+		q.outbound = outbound;
 		q.ipversion = skb->protocol == bpf_htons(ETH_P_IP) ? 4 : 6;
 		q.l4proto = l4proto;
 		__u32 *alive;
@@ -1801,8 +1832,12 @@ static __always_inline int get_pid_pname(struct pid_pname *pid_pname)
 	u8 offset = ctx.l;
 
 	for (u8 i = 0; i < TASK_COMM_LEN; i++) {
-		if (offset + i < MAX_ARG_LEN && arg_buf[offset + i] != '\0') {
-			pid_pname->pname[i] = arg_buf[offset + i];
+		__u32 idx = offset + i;
+
+		// Keep clang from splitting idx back into offset + i (clang 23).
+		asm volatile("" : "+r"(idx));
+		if (idx < MAX_ARG_LEN && arg_buf[idx] != '\0') {
+			pid_pname->pname[i] = arg_buf[idx];
 		} else {
 			pid_pname->pname[i] = '\0';
 			break;
@@ -1926,124 +1961,6 @@ int tproxy_wan_cg_sendmsg6(struct bpf_sock_addr *ctx)
 {
 	update_map_elem_by_cookie(bpf_get_socket_cookie(ctx));
 	return 1;
-}
-
-SEC("sockops")
-int local_tcp_sockops(struct bpf_sock_ops *skops)
-{
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-	__u32 pid = BPF_CORE_READ(task, pid);
-
-	/* Only local TCP connection has non-zero pids. */
-	if (pid == 0)
-		return 0;
-
-	struct tuples_key tuple = {};
-
-	tuple.l4proto = IPPROTO_TCP;
-	tuple.sport = bpf_htonl(skops->local_port) >> 16;
-	tuple.dport = skops->remote_port >> 16;
-	if (skops->family == AF_INET) {
-		tuple.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		tuple.sip.u6_addr32[3] = skops->local_ip4;
-		tuple.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		tuple.dip.u6_addr32[3] = skops->remote_ip4;
-	} else if (skops->family == AF_INET6) {
-		tuple.sip.u6_addr32[3] = skops->local_ip6[3];
-		tuple.sip.u6_addr32[2] = skops->local_ip6[2];
-		tuple.sip.u6_addr32[1] = skops->local_ip6[1];
-		tuple.sip.u6_addr32[0] = skops->local_ip6[0];
-		tuple.dip.u6_addr32[3] = skops->remote_ip6[3];
-		tuple.dip.u6_addr32[2] = skops->remote_ip6[2];
-		tuple.dip.u6_addr32[1] = skops->remote_ip6[1];
-		tuple.dip.u6_addr32[0] = skops->remote_ip6[0];
-	} else {
-		return 0;
-	}
-
-	switch (skops->op) {
-	case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB: // dae sockets
-	{
-		struct tuples_key rev_tuple = {};
-
-		copy_reversed_tuples(&tuple, &rev_tuple);
-
-		struct routing_result *routing_result;
-
-		routing_result =
-			bpf_map_lookup_elem(&routing_tuples_map, &rev_tuple);
-		if (!routing_result || !routing_result->pid)
-			break;
-
-		if (!bpf_sock_hash_update(skops, &fast_sock, &tuple, BPF_ANY))
-			bpf_printk("fast_sock added: %pI4:%lu -> %pI4:%lu",
-				   &tuple.sip.u6_addr32[3],
-				   bpf_ntohs(tuple.sport),
-				   &tuple.dip.u6_addr32[3],
-				   bpf_ntohs(tuple.dport));
-		break;
-	}
-
-	case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB: // local client sockets
-	{
-		struct routing_result *routing_result;
-
-		routing_result =
-			bpf_map_lookup_elem(&routing_tuples_map, &tuple);
-		if (!routing_result || !routing_result->pid)
-			break;
-
-		if (!bpf_sock_hash_update(skops, &fast_sock, &tuple, BPF_ANY))
-			bpf_printk("fast_sock added: %pI4:%lu -> %pI4:%lu",
-				   &tuple.sip.u6_addr32[3],
-				   bpf_ntohs(tuple.sport),
-				   &tuple.dip.u6_addr32[3],
-				   bpf_ntohs(tuple.dport));
-		break;
-	}
-
-	default:
-		break;
-	}
-
-	return 0;
-}
-
-SEC("sk_msg/fast_redirect")
-int sk_msg_fast_redirect(struct sk_msg_md *msg)
-{
-	struct tuples_key rev_tuple = {};
-
-	rev_tuple.l4proto = IPPROTO_TCP;
-	rev_tuple.sport = msg->remote_port >> 16;
-	rev_tuple.dport = bpf_htonl(msg->local_port) >> 16;
-	if (msg->family == AF_INET) {
-		rev_tuple.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		rev_tuple.sip.u6_addr32[3] = msg->remote_ip4;
-		rev_tuple.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		rev_tuple.dip.u6_addr32[3] = msg->local_ip4;
-	} else if (msg->family == AF_INET6) {
-		rev_tuple.sip.u6_addr32[3] = msg->remote_ip6[3];
-		rev_tuple.sip.u6_addr32[2] = msg->remote_ip6[2];
-		rev_tuple.sip.u6_addr32[1] = msg->remote_ip6[1];
-		rev_tuple.sip.u6_addr32[0] = msg->remote_ip6[0];
-		rev_tuple.dip.u6_addr32[3] = msg->local_ip6[3];
-		rev_tuple.dip.u6_addr32[2] = msg->local_ip6[2];
-		rev_tuple.dip.u6_addr32[1] = msg->local_ip6[1];
-		rev_tuple.dip.u6_addr32[0] = msg->local_ip6[0];
-	} else {
-		return SK_PASS;
-	}
-
-	if (bpf_msg_redirect_hash(msg, &fast_sock, &rev_tuple, BPF_F_INGRESS) ==
-	    SK_PASS)
-		bpf_printk("tcp fast redirect: %pI4:%lu -> %pI4:%lu",
-			   &rev_tuple.sip.u6_addr32[3],
-			   bpf_ntohs(rev_tuple.sport),
-			   &rev_tuple.dip.u6_addr32[3],
-			   bpf_ntohs(rev_tuple.dport));
-
-	return SK_PASS;
 }
 
 SEC("license") const char __license[] = "Dual BSD/GPL";
