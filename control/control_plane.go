@@ -99,6 +99,12 @@ type ControlPlane struct {
 	controlPlaneDatapathJanitor
 	bpfMaintenance *bpfMaintenanceBinding
 
+	// datapathResolverGen is the generation id returned by
+	// protocol.SetDatapathResolver for this plane. Close clears that resolver
+	// only when the id is still current, so a reload cannot wipe the next
+	// generation's resolver.
+	datapathResolverGen uint64
+
 	// Datapath counter report state. Unlike a per-alert timestamp, the baselines
 	// it holds are what let a resource alert describe the interval since the
 	// previous line instead of the lifetime total, which never returns to zero
@@ -608,7 +614,7 @@ func NewControlPlaneWithContextOptions(
 	// empty or points back at dae itself, the process resolver hangs or fails.
 	// The answer becomes the source address of a datagram sent to a client, so
 	// it must be a real record: no routing rewrite, no synthetic address.
-	protocol.SetDatapathResolver(func(ctx context.Context, host string) (netip.Addr, error) {
+	datapathResolverGen := protocol.SetDatapathResolver(func(ctx context.Context, host string) (netip.Addr, error) {
 		dns, err := systemDNSResolver.SystemDNS()
 		if err != nil {
 			return netip.Addr{}, err
@@ -916,12 +922,13 @@ func NewControlPlaneWithContextOptions(
 		directDialer: directDialer,
 		runtimeStats: processRuntimeStatsStore(),
 
-		memoryStats:   newMemoryStats(),
-		processCPU:    newProcessCPUStats(),
-		core:          core,
-		deferFuncs:    planeDeferFuncs,
-		listenIp:      "0.0.0.0",
-		egressRuntime: egressRuntime,
+		memoryStats:         newMemoryStats(),
+		processCPU:          newProcessCPUStats(),
+		core:                core,
+		deferFuncs:          planeDeferFuncs,
+		datapathResolverGen: datapathResolverGen,
+		listenIp:            "0.0.0.0",
+		egressRuntime:       egressRuntime,
 		controlPlaneGenerationState: controlPlaneGenerationState{
 			outbounds:           outbounds,
 			dnsRules:            dnsRulesFromConfig(&dnsConfig.Routing, routingGenerationID(policyIdentity.Epoch())),
@@ -3207,6 +3214,8 @@ func (c *ControlPlane) Close() (err error) {
 	c.ClearReloadDnsCacheSource()
 
 	c.closeOnce.Do(func() {
+		protocol.ClearDatapathResolver(c.datapathResolverGen)
+		c.datapathResolverGen = 0
 		c.unpublishActiveControlPlane()
 		c.unpublishRuntimeStats()
 		if c.cancel != nil {

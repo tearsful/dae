@@ -17,6 +17,7 @@
 | `#822` separate L2/L3 netdev programs | **manual port**: `*_l2`/`*_l3` SEC + `linkHdrLen()` loader |
 | `#1160` L3 strict-alignment loads | **covered** by `bpf_skb_load_bytes` parse path (no `parse_transport_fast` yet) |
 | `#1099` kdae full sync | **merged** to main; outbound via `github.com/tearsful/outbound` ≥ v0.3.20 (stickyip, scoped cache, NewDirectDialers, datapath resolver) |
+| `#1110` LAN UDP exact bind | **included** with kdae (`sock_bound_to_daddr`; skip dport 53); tests under `control/kern/tests` need Linux |
 
 Also: `common/bitlist` Tighten / Cap expectations aligned with upstream.
 
@@ -24,11 +25,11 @@ Also: `common/bitlist` Tighten / Cap expectations aligned with upstream.
 
 | Upstream | Why deferred |
 |---|---|
-| `#1110` LAN UDP exact bind match | lan-ingress local-socket bypass exact-match; now unblocked by kdae |
-| fast-path `parse_transport_fast` + `#1160` helpers | optional perf path; bring `pkt_load16/32` together |
+| fast-path `parse_transport_fast` + remaining `#1160` helpers | optional perf path; bring `pkt_load16/32` together |
+| true eBPF object compile on macOS | needs Linux/`make ebpf` (Docker unavailable locally); stub tag covers control-plane |
 
 ### Suggested next
 
-1. Port `#1110` on current main (kdae datapath already present).
+1. Run `make ebpf` / `make ebpf-test` on Linux CI to execute `#1110` ab_regression cases.
 2. Optionally port `parse_transport_fast` / remaining `#1164` control-plane API polish.
 3. Keep wing/daed pinned to tearsful/dae main + tearsful/outbound tags.
