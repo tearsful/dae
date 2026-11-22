@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 package routing
@@ -113,7 +113,7 @@ func ParseOutbound(rawOutbound *config_parser.Function) (outbound *Outbound, err
 			var _mark uint64
 			_mark, err = strconv.ParseUint(p.Val, 0, 32)
 			if err != nil {
-				return nil, fmt.Errorf("failed to parse mark: %v", err)
+				return nil, fmt.Errorf("failed to parse mark: %w", err)
 			}
 			outbound.Mark = uint32(_mark)
 		case "":

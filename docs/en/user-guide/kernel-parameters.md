@@ -1,11 +1,27 @@
 # Configure Kernel Parameters
 
 > **Note**
-> Parameters will be automatically configured if `global.auto_config_kernel_parameter` is `true`.
+> These parameters are configured automatically when `global.auto_config_kernel_parameter` is `true`.
 
-If you set up dae as a router or other intermediate device and bind it to LAN interfaces, you need to adjust some Linux kernel parameters to make everything work fine. By default, the latest Linux distributions have IP Forwarding `disabled`. In the case where we need to up a Linux router/gateway or a VPN server or simply a plain dial-in server, then we need to enable forwarding. Moreover, in order to keep our gateway position and keep correct downstream route table, we should disable `send-redirects`. Do the followings to adjust Linux kernel parameters:
+If dae acts as a router or another intermediate device and binds to LAN
+interfaces, adjust the Linux kernel parameters below.
 
-For every LAN interfaces you want to proxy:
+Independently of that option, dae changes these host parameters every time it
+starts, because replies injected from its `daens` network namespace re-enter the
+host through the `dae0` veth with a remote source address:
+`net.ipv4.conf.all.rp_filter = 0`, `net.ipv4.conf.all.arp_filter = 0`, and on
+`dae0` `rp_filter = 0`, `arp_filter = 0`, `accept_local = 1`, `disable_ipv6 = 0`
+and `forwarding = 1`. Inside its `daens` namespace, not on the host, dae also
+enables `net.ipv4.tcp_early_demux` and `net.ipv4.ip_early_demux` on a
+best-effort basis.
+
+Recent Linux distributions disable IP forwarding by default. Enable it when
+setting up a router, gateway, VPN server, or dial-in server. Disable
+`send_redirects` to keep dae as the gateway and preserve downstream routing tables.
+
+## 1. Configure LAN Interfaces
+
+For each LAN interface you want to proxy, replace `docker0` with the interface name:
 
 ```shell
 export lan_ifname=docker0
@@ -18,17 +34,35 @@ EOF
 sudo sysctl --system
 ```
 
-It is also recommended to enable IPv4 and IPv6 forward to avoid weird situations:
+`send_redirects` is read as the OR of `conf/all/send_redirects` and
+`conf/<interface>/send_redirects`, so the per-interface entry above changes
+nothing on its own: `conf/all/send_redirects` defaults to `1`, and the kernel
+keeps offering downstream clients a direct route to the upstream router, which
+bypasses dae. Disable the global node as well:
 
 ```shell
-echo "net.ipv4.ip_forward = 1" | sudo tee /etc/sysctl.d/60-ip-forward.conf
-echo "net.ipv6.conf.all.forwarding = 1" | sudo tee /etc/sysctl.d/60-ip-forward.conf
+printf 'net.ipv4.conf.all.send_redirects = 0\n' | sudo tee /etc/sysctl.d/60-dae-send-redirects.conf
 sudo sysctl --system
 ```
 
-Please modify `docker0` to your LAN interface.
+The reverse is also true: `conf/all/send_redirects = 0` is not enough on its own
+either, because an interface whose own node is still `1` keeps sending redirects.
+They stop only where both nodes are `0`, which is the case for the LAN interfaces
+dae actually configures. Interfaces dae leaves alone - WAN, for example - keep
+their own node at the default `1` and go on sending them.
 
-For your WAN interfaces that accept RA:
+## 2. Enable Global Forwarding
+
+Enable global IPv4 and IPv6 forwarding to avoid unexpected behavior:
+
+```shell
+printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' | sudo tee /etc/sysctl.d/60-ip-forward.conf
+sudo sysctl --system
+```
+
+## 3. Configure WAN Interfaces
+
+For WAN interfaces that accept router advertisements (RA), replace `eth0` with the interface name:
 
 ```shell
 export wan_ifname=eth0
@@ -41,6 +75,6 @@ EOF
 fi
 ```
 
-Please modify `eth0` to your WAN interface.
-
-Setting accept_ra to 2 if it is 1 because `net.ipv6.conf.all.forwarding = 1` will suppress it. See <https://sysctl-explorer.net/net/ipv6/accept_ra/> for more information.
+If `accept_ra` is `1`, change it to `2`: setting
+`net.ipv6.conf.all.forwarding = 1` suppresses RA acceptance when `accept_ra` is `1`.
+See <https://sysctl-explorer.net/net/ipv6/accept_ra/>.

@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 package assets
@@ -109,6 +109,12 @@ func (c *LocationFinder) GetLocationAsset(log *logrus.Logger, filename string) (
 	log.Debugf(`Search "%v" in [%v]`, filename, strings.Join(searchDirs, ", "))
 	for _, searchDir := range searchDirs {
 		searchPath := filepath.Join(searchDir, filename)
+		// Reject lexical ".." traversal. Symlink resolution remains governed
+		// by the trust assigned to configured asset directories.
+		if rel, relErr := filepath.Rel(searchDir, searchPath); relErr != nil ||
+			rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("asset filename escapes search directory: %v", filename)
+		}
 		if _, err = os.Stat(searchPath); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				continue

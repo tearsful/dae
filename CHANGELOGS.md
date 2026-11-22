@@ -14,7 +14,9 @@ curl --silent "https://api.github.com/repos/daeuniverse/dae/releases" | jq -r '.
 
 <!-- BEGIN NEW TOC ENTRY -->
 
-- [v1.0.0 (Latest)](#v100-latest)
+- [v2.0.0 (Latest)](#v200-latest)
+- [v1.1.0](#v110)
+- [v1.0.0](#v100)
 - [v0.9.0)](#v090)
 - [v0.8.0](#v080)
 - [v0.7.4](#v074)
@@ -47,7 +49,309 @@ curl --silent "https://api.github.com/repos/daeuniverse/dae/releases" | jq -r '.
 - [v0.1.0](#v010)
 <!-- BEGIN NEW CHANGELOGS -->
 
-### v1.0.0 (Latest)
+### Unreleased
+
+#### Features
+
+- Native API (`api` section) now covers groups, runtime selection, asynchronous operations and traffic history:
+  - `GET /api/v1/groups`, `GET /api/v1/groups/{group_id}` and read-only
+    `GET /api/v1/groups/{group_id}/config` report user-configured groups with
+    stable `g_`/`n_` identifiers, policy mapping, configuration and runtime
+    selection.
+  - New `select` group policy, plus `select(n)` to start at a given member.
+    `PUT /api/v1/groups/{group_id}/selection` switches the member per transport
+    (`tcp`, `udp` or `both`). The choice is memory-only: it is never written back
+    to the configuration and a reload returns to the configured index.
+  - `POST /api/v1/operations/reload|suspend|resume` return `202` with a pollable
+    operation, honour `Idempotency-Key`, and report the resulting generation or
+    runtime state.
+  - `GET /api/v1/runtime/traffic/history` exposes the recorded traffic samples
+    with validated `window_seconds` / `max_points` bounds.
+  - `GET /api/v1/nodes` and `GET /api/v1/nodes/{node_id}` list every managed
+    node with its group membership and typed health samples; pagination is
+    cursor-based and bound to one generation. Node management
+    (`POST /api/v1/nodes`, `DELETE /api/v1/nodes/{node_id}`) and
+    `POST /api/v1/providers/{provider_id}/refresh` are gated on
+    `api.config_write` plus the managed layout; without both they answer
+    `404 capability_not_supported`.
+  - Group `runtime.health` now reports per-member probe state, latency,
+    10-sample average and moving average, plus the metric the group sorts by.
+  - Automatic policies (`random`, `min`, `min_avg10`, `min_moving_avg`) accept
+    a runtime pin through `PUT /groups/{group_id}/selection`
+    (`source: "override"`); `DELETE` clears it. The pin is per transport,
+    memory-only and resets on reload.
+  - `capabilities` now advertises `groups`, `nodes`, `traffic_history`,
+    `operations`, `reload`, `suspend` and `resume`.
+  - The remaining implemented resources are advertised too: DNS cache, log,
+    rules and active query; connections and flows; the `events` and `logs`
+    server-sent event streams; asynchronous probes; routing trace; direct-stats
+    attachment status; and configuration-source writes (`GET /config`,
+    `GET/PUT /config/sources/{id}`, `POST /config/validate`, `POST /nodes`,
+    `DELETE /nodes/{id}`, `PATCH /nodes/{id}` and
+    `POST /providers/{id}/refresh`). Only `/runtime/settings` and `/auth/*`
+    stay at `404 capability_not_supported`.
+  - Probes honour the contract's warmth rule: `cold` is accepted, `warm`
+    answers `422 unsupported_value` because the engine cannot promise reuse,
+    results report `warmth: "unknown"`, and work cancelled by the job deadline
+    reports `state: "unknown"` rather than `unavailable`. Oversized fan-out is
+    rejected with `413 request_too_large` before dispatch, and configured
+    HTTP/DNS check targets follow the requested IP family.
+  - `GET /flows?connection_id=` matches active and closed flows, so a connection
+    that is still open is no longer missing from the list. DNS log cache hits
+    omit `upstream` (no upstream was contacted) and the `name` filter matches
+    substrings.
+
+#### Bug Fixes
+
+- Fix the native API's real-time speed being wrong (often `0 B/s`) in
+  dashboards: traffic buckets only rotated when a snapshot was taken, so every
+  byte between two polls landed in the first finished 250ms bucket and the
+  one-second rate was scaled by that bucket's share of the window. Buckets now
+  rotate as bytes are recorded, which keeps the live rate accurate at any poll
+  cadence and stops the fabricated spikes it produced in the history chart.
+- Fix traffic history thinning: `max_points` is now met by keeping every Nth
+  recorded sample verbatim, as the contract requires, instead of aggregating
+  groups with their maximum (which invented peaks the recorder never measured).
+- Report `datapath.state = "disabled"` while the runtime is suspended instead of
+  claiming the datapath is active.
+- Scope `runtime.traffic` to visible traffic: `observed_by` is `"userspace"` and
+  the counters no longer include flows the datapath forwards without the relay.
+  The datapath used to keep a PERCPU counter and an LRU pass-through index for
+  them, costing about 12 MiB of memlock and one map update per packet on the
+  direct path on every installation, including those that never enable the API.
+- Keep `runtime.traffic` totals across a reload and share one `counter_since`
+  with `runtime/outbounds`: the traffic store is now process-lifetime like the
+  per-outbound registry, so surviving flows keep landing in the numbers a
+  dashboard reads. Rates come from a one-second sampler, so recording a byte
+  costs one atomic add and no clock read.
+- Report data-UDP health samples (borrowing the DNS sibling the engine ranks by),
+  make `sorting_latency_ms` the value the alive set actually compares (policy
+  metric + recovery penalty + `add_latency`), and fill `ranking` with
+  `metric`/`score`/`group_offset_ms`/`recovery_penalty_ms`/`rank`/
+  `delta_to_best_ms`.
+- Return `purpose: "data"` instead of `"shared"` for TCP health samples.
+  Clients pick their primary latency from `transport=tcp,purpose=data`, found
+  nothing, and reported every member as untested with zero available.
+- Report the member an automatic policy is actually dialing in
+  `groups[].selection` / `runtime.selection` instead of `null`; `random` still
+  reports none.
+- Export the configured routing rules in `GET /api/v1/rules` instead of the
+  optimizer-expanded tree. Reporting the evaluation order rewrote selector
+  names, flattened every `geosite` into hundreds of thousands of suffixes and
+  mixed in injected sniff-punt lines - an 8.5 MB response describing rules
+  nobody wrote. The resource now returns the rules as written. Note that
+  `index` / `rule_id` therefore follow the configuration, not the kernel
+  evaluation order, which may merge adjacent rules and inject its own.
+- Distinguish an unlimited cgroup (`memory.max == "max"`) from a system that
+  does not report cgroup memory at all, so the dashboard can show "no limit"
+  instead of "unknown".
+- Keep Idempotency-Key replay working for node PATCH retries after a link
+  change moves the node id, and stop rejected-operation floods from evicting the
+  replay key of a completed write.
+- Do not repopulate a DNS cache entry after `DELETE /dns/cache` or
+  `POST /dns/cache/flush` when an upstream resolution was already in flight:
+  the invalidation epoch now advances on every delete/flush call and every
+  resolution store checks it, including the async store after a response is
+  sent.
+- Bound DNS upstream attempts by the API query's caller deadline and interrupt
+  a blocked UDP read when the caller cancels, instead of returning a late
+  `NOERROR` after the advertised timeout.
+- Remove direct-stats master hooks whose program name carries a LAN/WAN role,
+  so a bridge that gains its first member stops counting the same bytes twice,
+  and drop the phantom hook entry left by a failed optional classic attach.
+- Report `runtime.process.cpu_percent` instead of always `null`. The value is
+  the daemon's CPU time over the latest one-second interval as a percentage of
+  one CPU, sampled from `/proc/<pid>/stat`, so a dashboard can show CPU usage;
+  it stays `null` until a second sample exists.
+
+See `api_dev.md` section 10 for the per-issue evidence and verification.
+
+- Keep proxied UDP flows on the proxy after both directions stay silent for
+  the stale timeout (5 s). Rebuilding the endpoint deleted the flow's
+  conn-state, the proxied reply recreated it as an inbound flow, and later
+  client packets went direct, for example a game's next round (#1137).
+
+#### Build and release
+
+- Add a 20:00 UTC+8 nightly build for days with new commits, publishing only to `nightly`.
+- Include Go modules in full-source archives and use the bundled cache automatically.
+- Build the release packages with clang 22 on Ubuntu 26.04.
+- The Dockerfile builds with clang 22 on Ubuntu 26.04 and needs BuildKit (`docker buildx`).
+
+#### Behavior changes / Upgrade notes
+
+Existing config files keep parsing, but the following defaults and semantics
+changed. Review them before upgrading:
+
+- The rpm packages use the rpm v6 format, which rpm 4.14 and newer install.
+  rpm 4.11 (CentOS 7, Amazon Linux 2) cannot install them; neither system
+  ships a kernel that dae supports.
+- The `DAE_SEMANTIC_REFACTOR_FEATURES` environment variable was removed. The
+  routing epoch (lossless reload) is now the only publication path, and the
+  experimental bounded UDP dispatchers were deleted in favour of the per-flow
+  convoy task pool; setting the variable now has no effect. Convoy tasks also
+  gained per-task panic isolation with rate-limited reporting.
+- Transports implementing the fork's push-mode packet receiver
+  (`netproxy.PacketReceiver`: direct via a shared epoll loop, QUIC-family via
+  their existing transport readers) now deliver upstream UDP replies through
+  that receiver by default instead of one blocking `ReadFrom` goroutine per
+  endpoint. Replies are still ordered per endpoint through a bounded queue,
+  and overload drops only the excess packet.
+- `sniffing_timeout` default lowered from `100ms` to `30ms`. Slow first-packet
+  clients that previously sniffed successfully may now fall back to non-sniffed
+  routing; combined with the sniff negative cache this makes domain-based
+  splitting silently stop applying to such flows. Set
+  `sniffing_timeout: 100ms` explicitly to restore the old behavior.
+- New `bootstrap_resolver` option. When DNS upstream hostnames need resolving
+  before any upstream is ready, dae now defaults to `119.29.29.29:53` and
+  `223.5.5.5:53`. Users outside mainland China likely want to set
+  `bootstrap_resolver` to a closer resolver.
+- `so_mark_from_dae` semantics: when the option is absent, dae now
+  auto-selects an internal fwmark for its own egress traffic instead of
+  leaving it unset. Setups whose policy routing matched on "no mark" must set
+  `so_mark_from_dae: 0` explicitly (an explicit `0` keeps the old behavior).
+- New `disable_thp` option (default `false`) can opt the dae process out of
+  transparent huge pages via `prctl(PR_SET_THP_DISABLE)`. The default leaves
+  kernel memory policy untouched; enable it if you observe RSS inflation on
+  `THP=always` systems.
+- Routing optimizer no longer merges single-function `!`-negated rules into
+  combined match sets. Merging negated sets changed match semantics
+  (`!a` + `!b` merged is not `!a && !b`); affected configs may observe routing
+  results narrowing back to what the rules literally say.
+- The bundled systemd unit no longer sets `MemoryHigh=512M` and restarts only
+  on abnormal exits (`Restart=on-abnormal`) with a crash-loop limit. dae also
+  no longer derives `GOMEMLIMIT` from `memory.high` — only `memory.max`
+  participates, and an explicit `GOMEMLIMIT` environment variable always wins.
+- A named parameter is now rejected on the routing functions that take bare
+  values (`pname`, `port`/`dport`, `sport`, `dscp`, `ip`/`dip`, `sip`,
+  `ipversion`, `l4proto`, `mac`, `qtype`, and the response-routing `upstream`).
+  The grammar accepts `key: value` inside every function call, and these
+  parsers used to ignore the key, so a mistyped parameter name was read as one
+  more operand: `port(bogus_param: 443)` silently built the same match set as
+  `port(443)` and `pname(bogus_param: 1)` matched a process named `1`, on both
+  the `dae run` and the `dae validate` path. Such a rule now fails with
+  `unsupported parameter key "bogus_param"` and names the accepted form. The
+  documented short form (`pname(NetworkManager)`, `port(443)`,
+  `dip(geoip:cn)`, `domain(geosite:cn, suffix:quay.io)`) is unaffected.
+
+  This one does not merely change a default: a config that used a parameter
+  name on these functions stops starting until the name is removed. That is the
+  point — the previous behaviour was a different rule, not the one written —
+  but it has to be reviewed before upgrading.
+- A truncated (TC=1) answer is now retried over TCP for the DNS upstreams that
+  can carry it, and only for those. RFC 7766 §5 requires a forwarder to retry a
+  truncated answer over TCP, and RFC 1035 §4.2.1 permits a server to answer
+  TC=1 when the answer does not fit one datagram; dae used to lose that signal:
+
+  - `udp://`: the retry is now performed, and the TCP forwarder is built from
+    the rewritten transport (it used to be rejected with `unexpected scheme:
+    udp`, so the retry never left the process and the client got TC=1);
+  - `tcp+udp://`: unchanged, it already retried on every UDP failure;
+  - as-is (the built-in transparent destination, or any other scheme): not
+    retried. As-is means "ask the server the request was addressed to, as the
+    request arrived" (see `docs/*/configuration/dns.md`), so the TC=1 answer the
+    destination sent is passed to the client verbatim, with no TCP connection
+    opened on the client's behalf and no second upstream selection. The client
+    decides for itself whether to retry over TCP, exactly as it would without
+    dae in the path. When the client's own UDP size limit is what truncated the
+    answer, the existing client-facing TC=1 path is unchanged.
+
+  A successful upgrade delivers the complete answer where the client used to
+  receive TC=1, so no configuration change is needed; the observable difference
+  is that these answers now resolve on the first query.
+
+- The `daeuniverse/dae` Docker image is now built from the release assets.
+  `latest` follows the newest release instead of the main branch, each release
+  and prerelease is tagged with its version, the rolling build is `nightly`,
+  and no image is built for each commit on main.
+
+#### Bug Fixes
+
+- fix(control): flush short TCP splice writes without corking
+- fix(control): disable `send_redirects` on `conf/all` too, so LAN redirects actually stop
+- fix(config): restore `Marshaller.Bytes` for embedding callers such as dae-wing
+- fix(config): quote the whole `name: value` entry in the digit-prefix hint, and dry-run `fixed_domain_ttl` parsing from `dae validate` so a malformed entry no longer exits 0 and then aborts daemon startup
+- fix(kern): load the L3 TC programs on strict-alignment kernels such as LoongArch, which rejected them with `misaligned packet access` at startup
+- fix(kern): load the cgroup socket programs when built with clang 23, which the verifier rejected with `invalid variable-offset read from stack` at startup
+
+### v2.0.0 (Latest)
+
+> Release date: 2026/07/08
+
+#### Features
+
+- feat: improve log timestamp format with ForceFormatting in [#1010](https://github.com/daeuniverse/dae/pull/1010) by (@itoywh)
+
+#### Bug Fixes
+
+- fix(ebpf): fix "bad CO-RE relocation" on GCC 15 by disabling unnecessary UAPI CO-RE in [#986](https://github.com/daeuniverse/dae/pull/986) by (@KongQBin)
+- fix(docker): update Go version to 1.26 in Dockerfile in [#989](https://github.com/daeuniverse/dae/pull/989) by (@KagurazakaNyaa)
+- fix(bpf): restore cmdline parsing for accurate process name in [#991](https://github.com/daeuniverse/dae/pull/991) by (@TnZzZHlp)
+- fix(bpf): fallback to bpf_get_current_comm when bpf_get_current_task is unavailable in [#995](https://github.com/daeuniverse/dae/pull/995) by (@QiuSimons)
+- fix: carry ipv4 udp fallback, outbound, trace and conn-state follow-ups in [#980](https://github.com/daeuniverse/dae/pull/980) by (@olicesx)
+
+#### Others
+
+- ci/docs/optimize/feature: Enhance control plane features and improve CI workflows by olicesx in [#970](https://github.com/daeuniverse/dae/pull/970) by (@MarksonHon)
+- ci(release): draft release v1.1.0 in [#976](https://github.com/daeuniverse/dae/pull/976) by (@sumire88)
+- ci(release): draft release v2.0.0rc1 in [#978](https://github.com/daeuniverse/dae/pull/978) by (@dae-prow)
+- docs: add official repository installation guide for Arch Linux in [#981](https://github.com/daeuniverse/dae/pull/981) by (@Integral-Tech)
+- ci: build for GORISCV64 variants in [#994](https://github.com/daeuniverse/dae/pull/994) by (@Xeonacid)
+- docs: fix stale contribution instructions in [#1002](https://github.com/daeuniverse/dae/pull/1002) by (@immanuwell)
+
+**Example Config**: https://github.com/daeuniverse/dae/blob/v2.0.0/example.dae
+
+**Full Changelog**: https://github.com/daeuniverse/dae/compare/v1.1.0...v2.0.0
+
+### v1.1.0
+
+> Release date: 2026/04/23
+
+#### Features
+
+- optimize(bpf): Load separate programs for L2/L3 netdev in [#822](https://github.com/daeuniverse/dae/pull/822) by (@jschwinger233)
+- feat(anytls): support anytls tcp&&udp in [#852](https://github.com/daeuniverse/dae/pull/852) by (@cubatic45)
+- feat(outbound): support udphop for hysteria2 in [#786](https://github.com/daeuniverse/dae/pull/786) by (@LostAttractor)
+- feat: add TLS fragmentation in [#825](https://github.com/daeuniverse/dae/pull/825) by (@null)
+- feat(dns): support dns bind to local port in [#878](https://github.com/daeuniverse/dae/pull/878) by (@bradfordzhang)
+- feat(dns): support tcp+udp schema for dns local bind in [#885](https://github.com/daeuniverse/dae/pull/885) by (@tomaegg)
+- feat(control): add runtime traffic metrics and node latency probing in [#968](https://github.com/daeuniverse/dae/pull/968) by (@ksong008)
+
+#### Bug Fixes
+
+- fix(tproxy): refactor parse_transport and fix wrong ipv6 extension header offset calc in [#844](https://github.com/daeuniverse/dae/pull/844) by (@LostAttractor)
+- fix(bpf): Fix bpf timer in [#845](https://github.com/daeuniverse/dae/pull/845) by (@jschwinger233)
+- fix(outbound): Fix anytls dialer. in [#865](https://github.com/daeuniverse/dae/pull/865) by (@ppdragon16)
+- fix(dns): fix dns bind issue when reload in [#884](https://github.com/daeuniverse/dae/pull/884) by (@bradfordzhang)
+- fix: support absolute paths in include directive in [#908](https://github.com/daeuniverse/dae/pull/908) by (@tsx8)
+- fix: Remove sockmap fast tcp redirect in [#912](https://github.com/daeuniverse/dae/pull/912) by (@jschwinger233)
+- fix(tproxy): avoid conflicts with LAN ingress by filtering direct rou… in [#925](https://github.com/daeuniverse/dae/pull/925) by (@olicesx)
+- fix(tproxy): re-apply fwmark on non-SYN TCP packets in LAN ingress in [#939](https://github.com/daeuniverse/dae/pull/939) by (@luhengsw)
+
+#### Others
+
+- ci(release): draft release v1.0.0 in [#832](https://github.com/daeuniverse/dae/pull/832) by (@dae-prow)
+- chore(bpf): Cleanup dead bpf code in [#842](https://github.com/daeuniverse/dae/pull/842) by (@jschwinger233)
+- docs(config): clarify domain rule comment in [#834](https://github.com/daeuniverse/dae/pull/834) by (@akiooo45)
+- docs(AnyTLS): add AnyTLS doc in [#856](https://github.com/daeuniverse/dae/pull/856) by (@cubatic45)
+- docs(user-guide): fix missing `chmod` after downloaded the sample config file and fix the link of release page in [#860](https://github.com/daeuniverse/dae/pull/860) by (@mozillazg)
+- ci(release): draft release v1.1.0rc1 in [#898](https://github.com/daeuniverse/dae/pull/898) by (@dae-prow)
+- ci: Bump little-vm-helper: 0.0.23 -> 0.0.28 in [#913](https://github.com/daeuniverse/dae/pull/913) by (@jschwinger233)
+- ci: use go 1.24 branch because go 1.25's issue#77217 in [#931](https://github.com/daeuniverse/dae/pull/931) by (@MarksonHon)
+- chore: upgrade utls to 1.8.2 in [#962](https://github.com/daeuniverse/dae/pull/962) by (@Integral-Tech)
+- ci/docs/optimize/feature: Enhance control plane features and improve CI workflows by olicesx in [#970](https://github.com/daeuniverse/dae/pull/970) by (@MarksonHon)
+
+**Example Config**: https://github.com/daeuniverse/dae/blob/v1.1.0/example.dae
+
+**Full Changelog**: https://github.com/daeuniverse/dae/compare/v1.0.0...v1.1.0
+
+#### New Contributors
+
+- @ppdragon16 made their first contribution in [#865](https://github.com/daeuniverse/dae/pull/865)
+- @olicesx made their first contribution in [#925](https://github.com/daeuniverse/dae/pull/925)
+- @ksong008 made their first contribution in [#968](https://github.com/daeuniverse/dae/pull/968)
+
+### v1.0.0
 
 > Release date: 2025/05/30
 
@@ -329,7 +633,7 @@ curl --silent "https://api.github.com/repos/daeuniverse/dae/releases" | jq -r '.
 
 - docs(protocols): delete redundant line in [#452](https://github.com/daeuniverse/dae/pull/452) by (@bradfordzhang)
 - ci(Makefile): enable trace module by default in [#455](https://github.com/daeuniverse/dae/pull/455) by (@hero-intelligent)
-- ci: update actions/checkout@v3 to actions/checkout@v4 in [#461](https://github.com/daeuniverse/dae/pull/461) by (@MarksonHon)
+- ci: update actions/checkout@v3 to actions/checkout@v6 in [#461](https://github.com/daeuniverse/dae/pull/461) by (@MarksonHon)
 - ci: update ci modules using nodejs to latest in [#465](https://github.com/daeuniverse/dae/pull/465) by (@MarksonHon)
 - style: format bpf c code using kernel checkpatch.pl in [#477](https://github.com/daeuniverse/dae/pull/477) by (@jschwinger233)
 - chore: bump submodule dae_bpf_headers in [#487](https://github.com/daeuniverse/dae/pull/487) by (@jschwinger233)

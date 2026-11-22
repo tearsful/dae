@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 package outbound
@@ -19,7 +19,10 @@ type DialerSelectionPolicy struct {
 }
 
 func NewDialerSelectionPolicyFromGroupParam(param *config.Group) (policy *DialerSelectionPolicy, err error) {
-	fs := config.FunctionListOrStringToFunctionList(param.Policy)
+	fs, err := config.ParseFunctionListOrString(param.Policy)
+	if err != nil {
+		return nil, err
+	}
 	if len(fs) > 1 || len(fs) == 0 {
 		return nil, fmt.Errorf("policy should be exact 1 function: got %v", len(fs))
 	}
@@ -49,6 +52,29 @@ func NewDialerSelectionPolicyFromGroupParam(param *config.Group) (policy *Dialer
 			Policy:     consts.DialerSelectionPolicy(f.Name),
 			FixedIndex: index,
 		}, nil
+
+	case consts.DialerSelectionPolicy_Select:
+		if f.Not {
+			return nil, fmt.Errorf("policy param does not support not operator: !%v()", f.Name)
+		}
+		switch {
+		case len(f.Params) == 0:
+			return &DialerSelectionPolicy{
+				Policy:     fName,
+				FixedIndex: 0,
+			}, nil
+		case len(f.Params) == 1 && f.Params[0].Key == "":
+			index, err := strconv.Atoi(f.Params[0].Val)
+			if err != nil {
+				return nil, fmt.Errorf(`invalid "%v" param format: %w`, f.Name, err)
+			}
+			return &DialerSelectionPolicy{
+				Policy:     fName,
+				FixedIndex: index,
+			}, nil
+		default:
+			return nil, fmt.Errorf(`invalid "%v" param format`, f.Name)
+		}
 
 	default:
 		return nil, fmt.Errorf("unexpected policy: %v", f.Name)

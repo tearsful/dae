@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 package config
@@ -29,6 +29,11 @@ func (c *Config) Marshal(indentSpace int) (b []byte, err error) {
 		if !ok {
 			return nil, fmt.Errorf("section %v misses tag mapstructure", t.Field(i).Name)
 		}
+		// Keep disabled API configuration out of marshalled output so consumers
+		// that predate the section do not reject an otherwise unchanged config.
+		if k == "api" && !c.Api.Enabled {
+			continue
+		}
 		if err = m.MarshalSection(k, v.Field(i), 0); err != nil {
 			return nil, err
 		}
@@ -42,6 +47,8 @@ type Marshaller struct {
 	buf         bytes.Buffer
 }
 
+// Bytes returns the marshalled sections written so far. Embedding callers
+// such as dae-wing marshal a single section and need the raw output.
 func (m *Marshaller) Bytes() []byte {
 	return m.buf.Bytes()
 }
@@ -80,7 +87,7 @@ func (m *Marshaller) MarshalSection(name string, from reflect.Value, depth int) 
 		case reflect.String:
 			keyable := false
 			switch elemType {
-			case reflect.TypeOf(KeyableString("")):
+			case reflect.TypeFor[KeyableString]():
 				keyable = true
 			default:
 			}
@@ -132,13 +139,35 @@ func (m *Marshaller) MarshalSection(name string, from reflect.Value, depth int) 
 		goto unsupported
 	}
 
-	panic("code should not reach here")
-
 unsupported:
 	return fmt.Errorf("unsupported section type %v", from.Type())
 }
 
-func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err error) {
+func (m *Marshaller) marshalAndFunctionList(key string, from, annotation reflect.Value, depth int) error {
+	for i := 0; i < from.Len(); i++ {
+		andFuncs := from.Index(i)
+		if andFuncs.Len() == 0 {
+			continue
+		}
+		funcs := make([]*config_parser.Function, 0, andFuncs.Len())
+		for j := 0; j < andFuncs.Len(); j++ {
+			funcs = append(funcs, andFuncs.Index(j).Interface().(*config_parser.Function))
+		}
+		p := &config_parser.Param{
+			Key:          key,
+			AndFunctions: funcs,
+		}
+		if annotation.IsValid() && annotation.Kind() == reflect.Slice && i < annotation.Len() {
+			if a, ok := annotation.Index(i).Interface().([]*config_parser.Param); ok {
+				p.Annotation = a
+			}
+		}
+		m.writeLine(depth, p.String(true, true))
+	}
+	return nil
+}
+
+func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int, annotation reflect.Value) (err error) {
 	if m.IgnoreZero && from.IsZero() {
 		// Do not marshal zero value.
 		return nil
@@ -148,9 +177,14 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err
 		if from.Len() == 0 {
 			return nil
 		}
+		if from.Type().Elem().Kind() == reflect.Slice && from.Type().Elem().Elem() == reflect.TypeFor[*config_parser.Function]() {
+			return m.marshalAndFunctionList(key, from, annotation, depth)
+		}
 		switch from.Index(0).Interface().(type) {
 		case fmt.Stringer, string,
+			uint,
 			uint8, uint16, uint32, uint64,
+			int,
 			int8, int16, int32, int64,
 			float32, float64,
 			bool:
@@ -163,7 +197,7 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err
 			var vals []string
 			for i := 0; i < from.Len(); i++ {
 				v := from.Index(i).Interface().(*config_parser.Function)
-				vals = append(vals, v.String(true, true, false))
+				vals = append(vals, v.MarshalString(true, true, false))
 			}
 			m.writeLine(depth, key+":"+strings.Join(vals, "&&"))
 		case KeyableString:
@@ -178,13 +212,27 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err
 	default:
 		switch val := from.Interface().(type) {
 		case fmt.Stringer, string,
+			uint,
 			uint8, uint16, uint32, uint64,
+			int,
 			int8, int16, int32, int64,
 			float32, float64,
 			bool:
 			m.writeLine(depth, key+":"+strconv.Quote(fmt.Sprintf("%v", val)))
 		case *config_parser.Function:
-			m.writeLine(depth, key+":"+val.String(true, true, false))
+			m.writeLine(depth, key+":"+val.MarshalString(true, true, false))
+		case []*config_parser.Function:
+			// Interface-typed fields (Group.Policy, Routing.Fallback) hold a
+			// function list when the config used the `policy: fixed(0)` /
+			// multi-function shape. from.Kind() is Interface for those, so the
+			// slice switch above never sees them; reuse its rendering.
+			var vals []string
+			for _, v := range val {
+				vals = append(vals, v.MarshalString(true, true, false))
+			}
+			m.writeLine(depth, key+":"+strings.Join(vals, "&&"))
+		case [][]*config_parser.Function:
+			return m.marshalAndFunctionList(key, reflect.ValueOf(val), annotation, depth)
 		default:
 			return fmt.Errorf("unknown leaf type: %T", val)
 		}
@@ -207,9 +255,12 @@ func (m *Marshaller) marshalParam(from reflect.Value, depth int) (err error) {
 			return fmt.Errorf("tag mapstructure is required")
 		}
 		// Reserved field.
-		if key == "_" {
+		if key == "_" || key == "so_mark_from_dae_set" {
 			switch structField.Name {
 			case "Name":
+			case "FilterAnnotation":
+			case "SoMarkFromDaeSet":
+				continue
 			case "Rules":
 				// Expand.
 				rules, ok := field.Interface().([]*config_parser.RoutingRule)
@@ -234,8 +285,9 @@ func (m *Marshaller) marshalParam(from reflect.Value, depth int) (err error) {
 			continue
 		}
 
-		// Normal field.
-		if err = m.marshalLeaf(key, field, depth); err != nil {
+		// Pair Field with sibling FieldAnnotation by index (Group.Filter).
+		annotation := from.FieldByName(structField.Name + "Annotation")
+		if err = m.marshalLeaf(key, field, depth, annotation); err != nil {
 			return err
 		}
 	}

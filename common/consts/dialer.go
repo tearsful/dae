@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 package consts
@@ -8,41 +8,73 @@ package consts
 import (
 	"net/netip"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
+// IP protocol numbers from IANA protocol numbers registry.
+const (
+	// IPPROTO_TCP is the IP protocol number for TCP (RFC 793).
+	IPPROTO_TCP = 6
+	// IPPROTO_UDP is the IP protocol number for UDP (RFC 768).
+	IPPROTO_UDP = 17
+)
+
+// DialerSelectionPolicy defines the strategy for selecting a dialer from a group.
 type DialerSelectionPolicy string
 
 const (
-	DialerSelectionPolicy_Random                    DialerSelectionPolicy = "random"
-	DialerSelectionPolicy_Fixed                     DialerSelectionPolicy = "fixed"
-	DialerSelectionPolicy_MinAverage10Latencies     DialerSelectionPolicy = "min_avg10"
+	// DialerSelectionPolicy_Random selects a dialer randomly.
+	DialerSelectionPolicy_Random DialerSelectionPolicy = "random"
+	// DialerSelectionPolicy_Fixed always selects the first dialer.
+	DialerSelectionPolicy_Fixed DialerSelectionPolicy = "fixed"
+	// DialerSelectionPolicy_MinAverage10Latencies selects the dialer with minimum average latency of last 10 checks.
+	DialerSelectionPolicy_MinAverage10Latencies DialerSelectionPolicy = "min_avg10"
+	// DialerSelectionPolicy_MinMovingAverageLatencies selects the dialer with minimum moving average latency.
 	DialerSelectionPolicy_MinMovingAverageLatencies DialerSelectionPolicy = "min_moving_avg"
-	DialerSelectionPolicy_MinLastLatency            DialerSelectionPolicy = "min"
+	// DialerSelectionPolicy_MinLastLatency selects the dialer with minimum last latency.
+	DialerSelectionPolicy_MinLastLatency DialerSelectionPolicy = "min"
+	// DialerSelectionPolicy_Select keeps a runtime-switchable member. The
+	// configured index is only the initial choice; it is never written back to
+	// the configuration and is reset on reload.
+	DialerSelectionPolicy_Select DialerSelectionPolicy = "select"
 )
 
+// IgnoresDialerHealth reports whether the policy picks a member without
+// consulting per-dialer health state, so probes must not gate admission for
+// its groups.
+func (p DialerSelectionPolicy) IgnoresDialerHealth() bool {
+	return p == DialerSelectionPolicy_Fixed || p == DialerSelectionPolicy_Select
+}
+
+// SupportsOverride reports whether a pinned member may stand in for the
+// policy's automatic choice at runtime.
+func (p DialerSelectionPolicy) SupportsOverride() bool {
+	switch p {
+	case DialerSelectionPolicy_Random,
+		DialerSelectionPolicy_MinLastLatency,
+		DialerSelectionPolicy_MinAverage10Latencies,
+		DialerSelectionPolicy_MinMovingAverageLatencies:
+		return true
+	default:
+		return false
+	}
+}
+
 const (
+	// UdpCheckLookupHost is the default host used for UDP connectivity checks.
 	UdpCheckLookupHost = "connectivitycheck.gstatic.com."
+	// DefaultDialTimeout is the default timeout for dialing.
 	DefaultDialTimeout = 8 * time.Second
 )
 
+// L4ProtoStr represents a layer 4 protocol as a string.
 type L4ProtoStr string
 
 const (
+	// L4ProtoStr_TCP represents the TCP protocol.
 	L4ProtoStr_TCP L4ProtoStr = "tcp"
+	// L4ProtoStr_UDP represents the UDP protocol.
 	L4ProtoStr_UDP L4ProtoStr = "udp"
 )
-
-func (l L4ProtoStr) ToL4Proto() uint8 {
-	switch l {
-	case L4ProtoStr_TCP:
-		return unix.IPPROTO_TCP
-	case L4ProtoStr_UDP:
-		return unix.IPPROTO_IDP
-	}
-	panic("unsupported l4proto")
-}
 
 func (l L4ProtoStr) ToL4ProtoType() L4ProtoType {
 	switch l {
@@ -54,22 +86,15 @@ func (l L4ProtoStr) ToL4ProtoType() L4ProtoType {
 	panic("unsupported l4proto: " + l)
 }
 
+// IpVersionStr represents an IP version as a string.
 type IpVersionStr string
 
 const (
+	// IpVersionStr_4 represents IPv4.
 	IpVersionStr_4 IpVersionStr = "4"
+	// IpVersionStr_6 represents IPv6.
 	IpVersionStr_6 IpVersionStr = "6"
 )
-
-func (v IpVersionStr) ToIpVersion() uint8 {
-	switch v {
-	case IpVersionStr_4:
-		return 4
-	case IpVersionStr_6:
-		return 6
-	}
-	panic("unsupported ipversion")
-}
 
 func (v IpVersionStr) ToIpVersionType() IpVersionType {
 	switch v {

@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 // This file should trace https://github.com/daeuniverse/dae-config-dist/blob/main/dae_config.g4.
@@ -9,9 +9,10 @@ package config_parser
 
 import (
 	"fmt"
-	"github.com/antlr/antlr4/runtime/Go/antlr/v4"
 	"strconv"
 	"strings"
+
+	"github.com/antlr/antlr4/runtime/Go/antlr/v4"
 
 	"github.com/daeuniverse/dae-config-dist/go/dae_config"
 	"github.com/sirupsen/logrus"
@@ -76,11 +77,7 @@ func (w *Walker) parseNonEmptyParamList(list *dae_config.NonEmptyParameterListCo
 	return paramParser.list
 }
 
-func (w *Walker) reportKeyUnsupportedError(ctx interface{}, keyName, funcName string) {
-	w.ReportError(ctx, ErrorType_Unsupported, fmt.Sprintf("key %v in %v()", strconv.Quote(keyName), funcName))
-}
-
-type functionVerifier func(function *Function, ctx interface{}) bool
+type functionVerifier func(function *Function, ctx any) bool
 
 func (w *Walker) parseFunctionPrototype(ctx *dae_config.FunctionPrototypeContext, verifier functionVerifier) *Function {
 	children := ctx.GetChildren()
@@ -119,11 +116,11 @@ func (w *Walker) parseFunctionPrototype(ctx *dae_config.FunctionPrototypeContext
 	return f
 }
 
-func (w *Walker) ReportError(ctx interface{}, errorType ErrorType, target ...string) {
+func (w *Walker) ReportError(ctx any, errorType ErrorType, target ...string) {
 	if _, ok := ctx.(*antlr.ErrorNodeImpl); ok {
 		return
 	}
-	//debug.PrintStack()
+	// debug.PrintStack()
 	bCtx := BaseContext(ctx)
 	tgt := strconv.Quote(bCtx.GetStart().GetText())
 	if len(target) != 0 {
@@ -136,11 +133,11 @@ func (w *Walker) ReportError(ctx interface{}, errorType ErrorType, target ...str
 	w.parser.NotifyErrorListeners(fmt.Sprintf("%v %v.", tgt, errorType), bCtx.GetStart(), nil)
 }
 
-func (w *Walker) declarationFunctionVerifier(function *Function, ctx interface{}) bool {
-	//if function.Not {
-	//	w.ReportError(ctx, ErrorType_Unsupported, "Not operator in param declaration")
-	//	return false
-	//}
+func (w *Walker) declarationFunctionVerifier(function *Function, ctx any) bool {
+	// if function.Not {
+	// 	w.ReportError(ctx, ErrorType_Unsupported, "Not operator in param declaration")
+	// 	return false
+	// }
 	return true
 }
 
@@ -239,7 +236,7 @@ func (w *Walker) parseRoutingRule(ctx dae_config.IRoutingRuleContext) *RoutingRu
 		w.ReportError(ctx, ErrorType_Unsupported, "bad routing rule expression")
 		return nil
 	}
-	//logrus.Debugln(ctx.GetText(), children)
+	// logrus.Debugln(ctx.GetText(), children)
 	functionList, ok := children[0].(*dae_config.FunctionPrototypeExpressionContext)
 	if !ok {
 		w.ReportError(ctx, ErrorType_Unsupported, "not *FunctionPrototypeExpressionContext: "+ctx.GetText())
@@ -256,7 +253,8 @@ func (w *Walker) parseRoutingRule(ctx dae_config.IRoutingRuleContext) *RoutingRu
 	} else if f := outboundExpr.FunctionPrototype(); f != nil {
 		outbound = w.parseFunctionPrototype(f.(*dae_config.FunctionPrototypeContext), nil)
 	} else {
-		panic("unknown outboundExpr")
+		w.ReportError(ctx, ErrorType_Unsupported, "unknown outboundExpr: "+ctx.GetText())
+		return nil
 	}
 	return &RoutingRule{
 		AndFunctions: andFunctions,
@@ -320,8 +318,10 @@ func (w *Walker) parseExpression(exp dae_config.IExpressionContext) *Section {
 	list := children[2].(dae_config.IRoutingRuleOrDeclarationOrLiteralOrExpressionListContext)
 	items := w.parseRoutingRuleOrDeclarationOrLiteralOrExpressionListContext(list)
 	return &Section{
-		Name:  name,
-		Items: items,
+		Name:      name,
+		Items:     items,
+		StartLine: exp.GetStart().GetLine(),
+		EndLine:   exp.GetStop().GetLine(),
 	}
 }
 
