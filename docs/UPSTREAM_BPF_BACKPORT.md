@@ -16,6 +16,7 @@
 | `#995` `bpf_get_current_comm` fallback | `PARAM.has_bpf_get_current_task` |
 | `#822` separate L2/L3 netdev programs | **manual port**: `*_l2`/`*_l3` SEC + `linkHdrLen()` loader |
 | `#1160` L3 strict-alignment loads | **covered** by `bpf_skb_load_bytes` parse path (no `parse_transport_fast` yet) |
+| `#1099` kdae full sync | **merged** to main; outbound via `github.com/tearsful/outbound` ≥ v0.3.20 (stickyip, scoped cache, NewDirectDialers, datapath resolver) |
 
 Also: `common/bitlist` Tighten / Cap expectations aligned with upstream.
 
@@ -23,13 +24,11 @@ Also: `common/bitlist` Tighten / Cap expectations aligned with upstream.
 
 | Upstream | Why deferred |
 |---|---|
-| `#1099` kdae full sync | landed on `chore/kdae-datapath-rebase` (outbound via `github.com/tearsful/outbound` v0.3.20+) |
-| `#1110` LAN UDP exact bind match | depends on kdae lan-ingress local-socket bypass path |
-| fast-path `parse_transport_fast` + `#1160` helpers | comes with kdae; bring `pkt_load16/32` together |
+| `#1110` LAN UDP exact bind match | lan-ingress local-socket bypass exact-match; now unblocked by kdae |
+| fast-path `parse_transport_fast` + `#1160` helpers | optional perf path; bring `pkt_load16/32` together |
 
-### Suggested next rebase
+### Suggested next
 
-1. Branch from current main (L2/L3 already present).
-2. Take upstream `control/kern/tproxy.c` post-kdae as base.
-3. Re-apply tearsful deltas: outbound module path, `PARAM.has_bpf_get_current_task`, softwind/outbound pins.
-4. Port `#1110` and remaining control-plane API (`#1164`) as follow-ups.
+1. Port `#1110` on current main (kdae datapath already present).
+2. Optionally port `parse_transport_fast` / remaining `#1164` control-plane API polish.
+3. Keep wing/daed pinned to tearsful/dae main + tearsful/outbound tags.
