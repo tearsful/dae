@@ -1409,12 +1409,17 @@ int tproxy_wan_ingress(struct __sk_buff *skb)
 
 // Routing and redirect the packet back.
 // We cannot modify the dest address here. So we cooperate with wan_ingress.
+// Pass-through paths return TC_ACT_PIPE, not TC_ACT_OK, so that other filters
+// attached to the same clsact qdisc still get to see the packet: cls_bpf maps
+// TC_ACT_PIPE to TC_ACT_UNSPEC, which is the only return value that lets
+// __tcf_classify() continue down the filter chain. This matches what
+// wan_ingress and lan_egress already do. (upstream #1087)
 SEC("tc/wan_egress")
 int tproxy_wan_egress(struct __sk_buff *skb)
 {
 	// Skip packets not from localhost.
 	if (skb->ingress_ifindex != NOWHERE_IFINDEX)
-		return TC_ACT_OK;
+		return TC_ACT_PIPE;
 	// if ((skb->mark & 0x80) == 0x80) {
 	//	 return TC_ACT_OK;
 	// }
@@ -1435,9 +1440,9 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 	int ret = parse_transport(skb, link_h_len, &ethh, &iph, &ipv6h, &icmp6h,
 				  &tcph, &udph, &ihl, &l4proto);
 	if (ret)
-		return TC_ACT_OK;
+		return TC_ACT_PIPE;
 	if (l4proto == IPPROTO_ICMPV6)
-		return TC_ACT_OK;
+		return TC_ACT_PIPE;
 
 	// Backup for further use.
 	struct tuples tuples;
@@ -1468,7 +1473,7 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 			params.flag[6] = tuples.dscp;
 			if (pid_is_control_plane(skb, &pid_pname)) {
 				// From control plane. Direct.
-				return TC_ACT_OK;
+				return TC_ACT_PIPE;
 			}
 			if (pid_pname) {
 				// 2, 3, 4, 5
@@ -1516,7 +1521,7 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 
 			if (!routing_result) {
 				// Do not impact previous connections and server connections.
-				return TC_ACT_OK;
+				return TC_ACT_PIPE;
 			}
 			outbound = routing_result->outbound;
 			mark = routing_result->mark;
@@ -1532,7 +1537,7 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 #endif
 
 			skb->mark = mark;
-			return TC_ACT_OK;
+			return TC_ACT_PIPE;
 		} else if (unlikely(outbound == OUTBOUND_BLOCK)) {
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 			bpf_printk("SHOT OUTBOUND_BLOCK");
@@ -1598,7 +1603,7 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 		if (pid_is_control_plane(skb, &pid_pname)) {
 			// from control plane
 			// => direct.
-			return TC_ACT_OK;
+			return TC_ACT_PIPE;
 		}
 
 		struct udp_conn_state *conn_state =
@@ -1608,7 +1613,7 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 		if (conn_state->is_wan_ingress_direction) {
 			// Replay (outbound) of an inbound flow
 			// => direct.
-			return TC_ACT_OK;
+			return TC_ACT_PIPE;
 		}
 
 		if (pid_pname) {
@@ -1672,7 +1677,7 @@ int tproxy_wan_egress(struct __sk_buff *skb)
 		    // If mark is not zero, we should re-route it, so we send it to control
 		    // plane in WAN.
 		) {
-			return TC_ACT_OK;
+			return TC_ACT_PIPE;
 		} else if (unlikely(outbound ==
 				    OUTBOUND_BLOCK)) {
 			return TC_ACT_SHOT;
@@ -1827,8 +1832,12 @@ static __always_inline int get_pid_pname(struct pid_pname *pid_pname)
 	u8 offset = ctx.l;
 
 	for (u8 i = 0; i < TASK_COMM_LEN; i++) {
-		if (offset + i < MAX_ARG_LEN && arg_buf[offset + i] != '\0') {
-			pid_pname->pname[i] = arg_buf[offset + i];
+		__u32 idx = offset + i;
+
+		// Keep clang from splitting idx back into offset + i (clang 23).
+		asm volatile("" : "+r"(idx));
+		if (idx < MAX_ARG_LEN && arg_buf[idx] != '\0') {
+			pid_pname->pname[i] = arg_buf[idx];
 		} else {
 			pid_pname->pname[i] = '\0';
 			break;
