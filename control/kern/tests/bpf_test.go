@@ -211,7 +211,13 @@ func printBpfDebugLog(t *testing.T) {
 }
 
 func readBpfDebugLog(t *testing.T) string {
+	// Prefer the standalone tracefs mount used by modern kernels / CI images.
+	// Docker Desktop's linuxkit often only exposes the same pipe under debugfs
+	// until an explicit `mount -t tracefs` (see scripts/docker-ebpf-verify.sh).
 	fd, err := syscall.Open("/sys/kernel/tracing/trace_pipe", syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		fd, err = syscall.Open("/sys/kernel/debug/tracing/trace_pipe", syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	}
 	if err != nil {
 		t.Fatalf("Failed to open trace_pipe: %v", err)
 	}
