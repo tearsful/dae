@@ -167,10 +167,12 @@ func snapshotFromProbeObservation(link string, currentAlive bool, observation di
 				Alive:   true,
 				Latency: observation.Latency,
 			})
-		} else if observation.Message != "" {
-			// Keep probe error text (e.g. dial/HTTP failure) instead of dropping it.
+		} else if !observation.Alive && observation.Message != "" {
+			// Keep real probe failure text (e.g. dial/HTTP error).
 			snapshot.Message = observation.Message
 		} else {
+			// Alive may have flipped via traffic/other paths while LastProbe still
+			// holds a prior success sample — do not surface that stale "Nms" text.
 			snapshot.Message = "unavailable"
 		}
 	} else {

@@ -53,3 +53,68 @@ func TestPreferNodeLatencySnapshotAliveWins(t *testing.T) {
 		t.Fatal("dead should not beat alive")
 	}
 }
+
+func TestPreferNodeLatencySnapshotRTTAndCheckedAt(t *testing.T) {
+	low := int32(30)
+	high := int32(80)
+	older := time.Unix(100, 0)
+	newer := time.Unix(200, 0)
+
+	if !preferNodeLatencySnapshot(
+		NodeLatencySnapshot{Alive: true, LatencyMs: &low},
+		NodeLatencySnapshot{Alive: true, LatencyMs: &high},
+	) {
+		t.Fatal("lower RTT should win")
+	}
+	if preferNodeLatencySnapshot(
+		NodeLatencySnapshot{Alive: true, LatencyMs: nil},
+		NodeLatencySnapshot{Alive: true, LatencyMs: &low},
+	) {
+		t.Fatal("nil LatencyMs should not beat a measured sample")
+	}
+	if !preferNodeLatencySnapshot(
+		NodeLatencySnapshot{Alive: true, LatencyMs: &low, CheckedAt: newer},
+		NodeLatencySnapshot{Alive: true, LatencyMs: &low, CheckedAt: older},
+	) {
+		t.Fatal("newer CheckedAt should win on equal RTT")
+	}
+}
+
+func TestSnapshotFromProbeObservationMessages(t *testing.T) {
+	ms := 12 * time.Millisecond
+	alive := snapshotFromProbeObservation("ss://a", true, dialer.DialerProbeObservationSnapshot{
+		HasLatency: true,
+		Latency:    ms,
+		Alive:      true,
+		Message:    "12ms",
+	})
+	if alive.Message != "12ms" || alive.LatencyMs == nil || *alive.LatencyMs != 12 {
+		t.Fatalf("alive success: %+v", alive)
+	}
+
+	probeFail := snapshotFromProbeObservation("ss://a", false, dialer.DialerProbeObservationSnapshot{
+		HasLatency: false,
+		Alive:      false,
+		Message:    "dial tcp: i/o timeout",
+	})
+	if probeFail.Message != "dial tcp: i/o timeout" {
+		t.Fatalf("probe fail message: %q", probeFail.Message)
+	}
+
+	// Traffic/other path marked dead; LastProbe still a success sample.
+	stale := snapshotFromProbeObservation("ss://a", false, dialer.DialerProbeObservationSnapshot{
+		HasLatency: true,
+		Latency:    ms,
+		Alive:      true,
+		Message:    "12ms",
+	})
+	if stale.Message != "unavailable" {
+		t.Fatalf("stale success while dead should not keep Nms text, got %q", stale.Message)
+	}
+	if stale.Alive {
+		t.Fatal("stale snapshot should report currentAlive=false")
+	}
+	if stale.LatencyMs == nil || *stale.LatencyMs != 12 {
+		t.Fatalf("stale dead snapshot should keep last LatencyMs: %+v", stale)
+	}
+}
