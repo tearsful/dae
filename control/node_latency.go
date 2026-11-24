@@ -19,6 +19,8 @@ type NodeLatencySnapshot struct {
 	Alive     bool
 	Message   string
 	CheckedAt time.Time
+	// RecentMs is chronological TCP probe samples (oldest → newest), up to 10.
+	RecentMs []int32
 }
 
 // TriggerLatencyChecks asks dialers to refresh their TCP latency samples.
@@ -107,6 +109,7 @@ func bestNodeLatencySnapshotForDialer(d *dialer.Dialer) NodeLatencySnapshot {
 		},
 	}
 
+	var bestNetwork *dialer.NetworkType
 	for _, networkType := range checkTypes {
 		candidate, ok := nodeLatencySnapshotForNetwork(d, link, networkType)
 		if !ok {
@@ -114,7 +117,11 @@ func bestNodeLatencySnapshotForDialer(d *dialer.Dialer) NodeLatencySnapshot {
 		}
 		if snapshot.LatencyMs == nil || preferNodeLatencySnapshot(candidate, snapshot) {
 			snapshot = candidate
+			bestNetwork = networkType
 		}
+	}
+	if bestNetwork != nil {
+		attachRecentMs(d, bestNetwork, &snapshot)
 	}
 
 	return snapshot
@@ -167,6 +174,33 @@ func snapshotFromProbeObservation(link string, currentAlive bool, observation di
 		snapshot.Message = "no latency result"
 	}
 	return snapshot
+}
+
+func attachRecentMs(d *dialer.Dialer, networkType *dialer.NetworkType, snapshot *NodeLatencySnapshot) {
+	if d == nil || snapshot == nil || networkType == nil {
+		return
+	}
+	ordered := orderedLatencySamples(d.MustGetLatencies10(networkType).Snapshot())
+	if len(ordered) == 0 {
+		return
+	}
+	snapshot.RecentMs = make([]int32, 0, len(ordered))
+	for _, sample := range ordered {
+		snapshot.RecentMs = append(snapshot.RecentMs, int32(sample.Milliseconds()))
+	}
+}
+
+func orderedLatencySamples(snap dialer.LatenciesNSnapshot) []time.Duration {
+	n := len(snap.Latencies)
+	if n == 0 {
+		return nil
+	}
+	out := make([]time.Duration, 0, n)
+	for i := 0; i < n; i++ {
+		idx := (snap.Head + i) % n
+		out = append(out, snap.Latencies[idx])
+	}
+	return out
 }
 
 func preferNodeLatencySnapshot(next NodeLatencySnapshot, current NodeLatencySnapshot) bool {
