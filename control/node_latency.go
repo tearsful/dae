@@ -110,14 +110,17 @@ func bestNodeLatencySnapshotForDialer(d *dialer.Dialer) NodeLatencySnapshot {
 	}
 
 	var bestNetwork *dialer.NetworkType
+	haveCandidate := false
 	for _, networkType := range checkTypes {
 		candidate, ok := nodeLatencySnapshotForNetwork(d, link, networkType)
 		if !ok {
 			continue
 		}
-		if snapshot.LatencyMs == nil || preferNodeLatencySnapshot(candidate, snapshot) {
+		// First hit wins the slot; later hits must win via prefer rules (alive / lower RTT).
+		if !haveCandidate || preferNodeLatencySnapshot(candidate, snapshot) {
 			snapshot = candidate
 			bestNetwork = networkType
+			haveCandidate = true
 		}
 	}
 	if bestNetwork != nil {
@@ -164,7 +167,10 @@ func snapshotFromProbeObservation(link string, currentAlive bool, observation di
 				Alive:   true,
 				Latency: observation.Latency,
 			})
-		} else if observation.Alive || observation.Message == "" {
+		} else if observation.Message != "" {
+			// Keep probe error text (e.g. dial/HTTP failure) instead of dropping it.
+			snapshot.Message = observation.Message
+		} else {
 			snapshot.Message = "unavailable"
 		}
 	} else {
